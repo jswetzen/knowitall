@@ -1,0 +1,22 @@
+services:
+  knowitall:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: knowitall:latest
+    container_name: knowitall
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ../data:/data
+    environment:
+      KNOWITALL_TOKEN: ${KNOWITALL_TOKEN}
+      KNOWITALL_OLLAMA_URL: ${KNOWITALL_OLLAMA_URL:-http://192.168.1.33:11434}
+      KNOWITALL_OLLAMA_MODEL: ${KNOWITALL_OLLAMA_MODEL:-nomic-embed-text-v2-moe}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
