@@ -243,11 +243,11 @@ curl -sS http://192.168.1.33:11434/api/tags | grep nomic-embed-text-v2-moe
 
 ### Repo state at handover
 
-- Path: `/workspace/graphmem`
+- Path: `/workspace/knowitall`
 - Git: initialized, on `main`, **no commits yet**, working tree clean except this
   `PLAN.md` we're about to add.
 - The repo will be renamed/re-purposed as `knowitall`. Keep the path
-  `/workspace/graphmem` for now; rename later if desired.
+  `/workspace/knowitall` for now; rename later if desired.
 
 ### Step-by-step
 
@@ -430,7 +430,7 @@ For continuity once week 1 lands. Detailed design in the conversation, summary h
 ## 11. First commands to run in the new session
 
 ```bash
-cd /workspace/graphmem
+cd /workspace/knowitall
 ls -la
 git status
 git log --oneline | head -5     # should be empty / "no commits yet"

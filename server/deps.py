@@ -13,17 +13,18 @@ from schema.migrate import apply_migrations
 from server import config
 
 
-def _episodes_schema(dim: int) -> pa.Schema:
+def _embeddings_schema(dim: int) -> pa.Schema:
     return pa.schema(
         [
             pa.field("id", pa.string()),
+            pa.field("node_type", pa.string()),
             pa.field("text", pa.string()),
             pa.field("vector", pa.list_(pa.float32(), list_size=dim)),
-            pa.field("kind", pa.string()),
             pa.field("project_id", pa.string()),
-            pa.field("conversation_id", pa.string()),
+            pa.field("kind", pa.string()),
             pa.field("created_at", pa.timestamp("us", tz="UTC")),
             pa.field("model_version", pa.string()),
+            pa.field("retracted_at", pa.timestamp("us", tz="UTC")),
         ]
     )
 
@@ -32,7 +33,7 @@ def _episodes_schema(dim: int) -> pa.Schema:
 class AppState:
     kuzu_db: kuzu.Database
     lance_db: "lancedb.DBConnection"
-    episodes: "lancedb.table.Table"
+    embeddings: "lancedb.table.Table"
     http: httpx.AsyncClient
 
     def kuzu_conn(self) -> kuzu.Connection:
@@ -50,16 +51,23 @@ def build_state() -> AppState:
     apply_migrations(kuzu_db)
 
     lance_db = lancedb.connect(str(data_dir / "lance"))
-    if "episodes" in lance_db.list_tables():
-        episodes = lance_db.open_table("episodes")
+    tables = lance_db.list_tables()
+    # v2 cuts over: drop the v1 `episodes` table if it lingers. User has no
+    # data to migrate (per PLAN_V2.md), so this is safe.
+    if "episodes" in tables:
+        lance_db.drop_table("episodes")
+    if "embeddings" in tables:
+        embeddings = lance_db.open_table("embeddings")
     else:
-        episodes = lance_db.create_table(
-            "episodes",
-            schema=_episodes_schema(s.embedding_dim),
+        embeddings = lance_db.create_table(
+            "embeddings",
+            schema=_embeddings_schema(s.embedding_dim),
         )
 
     http = httpx.AsyncClient(base_url=s.ollama_url, timeout=5.0)
-    return AppState(kuzu_db=kuzu_db, lance_db=lance_db, episodes=episodes, http=http)
+    return AppState(
+        kuzu_db=kuzu_db, lance_db=lance_db, embeddings=embeddings, http=http
+    )
 
 
 async def embed(http: httpx.AsyncClient, text: str) -> list[float]:

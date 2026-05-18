@@ -1,1 +1,9 @@
 .env
+
+# OpenTofu / Terraform — under proxmox/
+proxmox/.terraform/
+proxmox/terraform.tfstate
+proxmox/terraform.tfstate.*
+proxmox/*.tfvars
+!proxmox/terraform.tfvars.example
+proxmox/crash.log

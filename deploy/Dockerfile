@@ -20,6 +20,7 @@ RUN uv sync --no-dev --no-install-project
 COPY server ./server
 COPY schema ./schema
 COPY client ./client
+COPY ingest ./ingest
 
 ENV KNOWITALL_DATA_DIR=/data \
     KNOWITALL_HOST=0.0.0.0 \

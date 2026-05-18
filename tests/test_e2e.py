@@ -69,13 +69,19 @@ async def test_store_query_via_mcp_client(live_server):
             await session.initialize()
             tools = await session.list_tools()
             tool_names = {t.name for t in tools.tools}
-            assert {"store_episode", "query_memory", "cypher"} <= tool_names
+            assert {
+                "record",
+                "query_memory",
+                "cypher",
+                "forget",
+                "update_todo",
+            } <= tool_names
 
             await session.call_tool(
-                "store_episode",
+                "record",
                 {
-                    "text": "fixture: ferrets favor floral fixtures",
                     "kind": "note",
+                    "body": "fixture: ferrets favor floral fixtures",
                     "project_hint": "fixturetest",
                 },
             )
