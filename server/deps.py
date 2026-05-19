@@ -62,6 +62,7 @@ def build_state() -> AppState:
         embeddings = lance_db.create_table(
             "embeddings",
             schema=_embeddings_schema(s.embedding_dim),
+            exist_ok=True,
         )
 
     http = httpx.AsyncClient(base_url=s.ollama_url, timeout=5.0)
