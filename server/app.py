@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from server.auth import BearerTokenMiddleware
 from server import config
@@ -16,7 +17,16 @@ def create_app() -> FastAPI:
     state = build_state()
     # stateless_http=False: Claude Code expects the Mcp-Session-Id header flow.
     # streamable_http_path="/mcp": canonical endpoint with no trailing slash.
-    mcp = FastMCP("knowitall", stateless_http=False, streamable_http_path="/mcp")
+    # transport_security: FastMCP auto-enables DNS-rebinding protection with a loopback-only
+    # Host allowlist when its `host` setting is a loopback address (the default). We run
+    # behind a bearer-token check on a private LAN, so disable that loopback-only check —
+    # otherwise any client reaching us at the CT's LAN IP gets a 421 before auth runs.
+    mcp = FastMCP(
+        "knowitall",
+        stateless_http=False,
+        streamable_http_path="/mcp",
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
     register_tools(mcp, state)
     register_prompts(mcp, state)
 
