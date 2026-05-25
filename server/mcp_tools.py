@@ -65,14 +65,27 @@ MEMORY_KIND_TO_LABEL: dict[str, str] = {
 # Per-label MATCH config for `list_memories` / `get_memory`. Each label exposes
 # a `created_at`-shaped timestamp under a different column name, so we project
 # it under a uniform alias. `body_field` is the column whose first
-# SUMMARY_MAX_LEN chars become the summary (Note already stores a title-shaped
-# value, so we read it verbatim).
-_LIST_FIELDS: dict[str, dict[str, str]] = {
-    "Decision": {"created_at_field": "decided_at", "body_field": "body"},
-    "Task":     {"created_at_field": "created_at", "body_field": "body"},
-    "Idea":     {"created_at_field": "created_at", "body_field": "body"},
-    "Note":     {"created_at_field": "created_at", "body_field": "title"},
-    "Episode":  {"created_at_field": "created_at", "body_field": "body"},
+# SUMMARY_MAX_LEN chars become the fallback summary. `summary_field` is the
+# stored summary column when present; Note has no parallel `summary` column
+# because `title` already serves that purpose, so `summary_field == "title"`
+# and `_summarize_with_fallback` resolves it without a body fallback.
+_LIST_FIELDS: dict[str, dict[str, str | None]] = {
+    "Decision": {"created_at_field": "decided_at", "body_field": "body",  "summary_field": "summary"},
+    "Task":     {"created_at_field": "created_at", "body_field": "body",  "summary_field": "summary"},
+    "Idea":     {"created_at_field": "created_at", "body_field": "body",  "summary_field": "summary"},
+    "Note":     {"created_at_field": "created_at", "body_field": "title", "summary_field": None},
+    "Episode":  {"created_at_field": "created_at", "body_field": "body",  "summary_field": "summary"},
+}
+
+# Allowed `kind` strings in `record(..., relates_to=[{"kind": ..., "id": ...}])`
+# → the graph edge label they translate to. SUPERSEDES_MEMORY is named that
+# way so it doesn't collide with v1's Decision→Decision SUPERSEDES (left
+# intact per the v3 schema decision).
+MEMORY_EDGE_KIND_TO_LABEL: dict[str, str] = {
+    "supersedes":  "SUPERSEDES_MEMORY",
+    "refines":     "REFINES",
+    "contradicts": "CONTRADICTS",
+    "relates_to":  "RELATES_TO_MEMORY",
 }
 
 
@@ -125,41 +138,54 @@ def _create_graph_node(
     body: str,
     kind: str,
     created_at: datetime,
+    summary: str | None = None,
 ) -> None:
+    """Insert a memory-bearing node. `summary` is stored only on labels with
+    a real `summary` column (Decision/Task/Idea/Episode). Note ignores the
+    arg because its `title` column already serves the title-shaped role —
+    Note's title is computed as the first SUMMARY_MAX_LEN chars of body if
+    no explicit summary was passed, else the explicit summary (also clipped).
+    """
     if label == "Episode":
         conn.execute(
             "CREATE (:Episode {id: $id, body: $b, kind: $k, created_at: $ts, "
-            "model_version: $mv, retracted_at: NULL})",
+            "model_version: $mv, retracted_at: NULL, amended_at: NULL, "
+            "summary: $s})",
             {
                 "id": node_id,
                 "b": body,
                 "k": kind,
                 "ts": created_at,
                 "mv": config.settings.ollama_model,
+                "s": summary,
             },
         )
     elif label == "Decision":
         conn.execute(
-            "CREATE (:Decision {id: $id, body: $b, decided_at: $ts, retracted_at: NULL})",
-            {"id": node_id, "b": body, "ts": created_at},
+            "CREATE (:Decision {id: $id, body: $b, decided_at: $ts, "
+            "retracted_at: NULL, amended_at: NULL, summary: $s})",
+            {"id": node_id, "b": body, "ts": created_at, "s": summary},
         )
     elif label == "Task":
         conn.execute(
             "CREATE (:Task {id: $id, body: $b, status: 'open', created_at: $ts, "
-            "closed_at: NULL, retracted_at: NULL})",
-            {"id": node_id, "b": body, "ts": created_at},
+            "closed_at: NULL, retracted_at: NULL, amended_at: NULL, summary: $s})",
+            {"id": node_id, "b": body, "ts": created_at, "s": summary},
         )
     elif label == "Idea":
         conn.execute(
             "CREATE (:Idea {id: $id, body: $b, status: 'open', created_at: $ts, "
-            "died_at: NULL, retracted_at: NULL})",
-            {"id": node_id, "b": body, "ts": created_at},
+            "died_at: NULL, retracted_at: NULL, amended_at: NULL, summary: $s})",
+            {"id": node_id, "b": body, "ts": created_at, "s": summary},
         )
     elif label == "Note":
+        # Note has no separate summary column — title is the summary. Prefer
+        # the explicit summary if given, else clip the body.
+        title = (summary if summary is not None else body)[:SUMMARY_MAX_LEN]
         conn.execute(
             "CREATE (:Note {id: $id, path: NULL, title: $b, created_at: $ts, "
-            "retracted_at: NULL})",
-            {"id": node_id, "b": body[:200], "ts": created_at},
+            "retracted_at: NULL, amended_at: NULL})",
+            {"id": node_id, "b": title, "ts": created_at},
         )
     else:
         raise ValueError(f"unknown graph label: {label}")
@@ -185,6 +211,26 @@ def _summarize(value: str | None) -> str | None:
     return value[:SUMMARY_MAX_LEN]
 
 
+def _effective_summary(
+    label: str, stored_summary: str | None, body_value: str | None
+) -> str | None:
+    """Resolve the summary surfaced to MCP callers.
+
+    Note has no separate column — `body_value` is already the title and is
+    the canonical summary.
+
+    For other labels: prefer the explicit stored `summary` if present, else
+    fall back to the first SUMMARY_MAX_LEN chars of body. This keeps the
+    contract stable across legacy rows (no summary column data) and new
+    rows recorded with an explicit summary.
+    """
+    if label == "Note":
+        return body_value  # already clipped at insert
+    if stored_summary is not None:
+        return stored_summary
+    return _summarize(body_value)
+
+
 def _list_one_label(
     conn,
     label: str,
@@ -196,11 +242,17 @@ def _list_one_label(
     fields = _LIST_FIELDS[label]
     ts_field = fields["created_at_field"]
     body_field = fields["body_field"]
+    summary_field = fields["summary_field"]
     node_type = "episode" if label == "Episode" else label.lower()
 
     clauses: list[str] = []
     if not include_retracted:
         clauses.append("n.retracted_at IS NULL")
+
+    # Note has no separate summary column — read body_field twice as a
+    # uniform stand-in (the second slot becomes `stored_summary`, which we
+    # then ignore via `_effective_summary("Note", ...)`).
+    summary_select = f"n.{summary_field}" if summary_field else f"n.{body_field}"
 
     params: dict[str, Any] = {}
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -222,16 +274,21 @@ def _list_one_label(
         )
         return_project_clause = "p.id AS pid"
 
+    # Alias both columns: Note has body_field == summary_field == "title",
+    # and Kuzu rejects duplicate result column names.
     query = (
         f"{match_clause} "
-        f"RETURN n.id, n.{body_field}, n.{ts_field}, n.retracted_at, "
-        f"{return_project_clause}"
+        f"RETURN n.id, n.{body_field} AS body_value, "
+        f"{summary_select} AS stored_summary, n.{ts_field}, "
+        f"n.retracted_at, {return_project_clause}"
     )
     result = conn.execute(query, params)
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     while result.has_next():
-        node_id, body_value, created_at, retracted_at, pid = result.get_next()
+        node_id, body_value, stored_summary, created_at, retracted_at, pid = (
+            result.get_next()
+        )
         # OPTIONAL MATCH can yield duplicates if a node has multiple Project
         # anchors. Dedup keeping first hit — project_id is informational, not
         # canonical (the graph holds the full set).
@@ -242,13 +299,81 @@ def _list_one_label(
             {
                 "id": node_id,
                 "node_type": node_type,
-                "summary": _summarize(body_value),
+                "summary": _effective_summary(label, stored_summary, body_value),
                 "project_id": pid,
                 "created_at": created_at,
                 "retracted_at": retracted_at,
             }
         )
     return rows
+
+
+def _write_memory_edge(
+    conn,
+    source_label: str,
+    source_id: str,
+    target_label: str,
+    target_id: str,
+    edge_label: str,
+    now: datetime,
+) -> None:
+    """Create one memory→memory edge if not already present.
+
+    Idempotent: re-issuing the same (source, target, edge) is a no-op. Uses
+    the same bi-temporal columns every other edge in the schema uses.
+    """
+    existing = conn.execute(
+        f"MATCH (s:{source_label} {{id: $sid}})-[e:{edge_label}]->"
+        f"(t:{target_label} {{id: $tid}}) RETURN e LIMIT 1",
+        {"sid": source_id, "tid": target_id},
+    )
+    if existing.has_next():
+        return
+    conn.execute(
+        f"MATCH (s:{source_label} {{id: $sid}}), "
+        f"(t:{target_label} {{id: $tid}}) "
+        f"CREATE (s)-[:{edge_label} {{valid_from: $now, valid_to: NULL, "
+        "recorded_at: $now, source_extractor: 'mcp', extractor_version: 'v3'}]->(t)",
+        {"sid": source_id, "tid": target_id, "now": now},
+    )
+
+
+def _apply_relates_to(
+    conn,
+    source_label: str,
+    source_id: str,
+    relates_to: list[dict[str, Any]],
+    now: datetime,
+) -> list[dict[str, str]]:
+    """Validate + write each memory→memory edge. Returns a summary list.
+
+    Each entry must be {"kind": <one of MEMORY_EDGE_KIND_TO_LABEL>, "id":
+    <target memory node id>}. Validation raises ValueError on unknown kind
+    or unknown / non-memory target id — fail at write-time, not silently.
+    """
+    out: list[dict[str, str]] = []
+    for spec in relates_to:
+        kind = spec.get("kind")
+        target_id = spec.get("id")
+        if kind not in MEMORY_EDGE_KIND_TO_LABEL:
+            raise ValueError(
+                f"unknown relates_to kind {kind!r}. "
+                f"Allowed: {sorted(MEMORY_EDGE_KIND_TO_LABEL)}"
+            )
+        if not target_id:
+            raise ValueError(f"relates_to entry missing 'id': {spec}")
+        target_label = _lookup_node_label(conn, target_id)
+        if target_label is None:
+            raise ValueError(
+                f"relates_to target {target_id!r} is not a memory node"
+            )
+        edge_label = MEMORY_EDGE_KIND_TO_LABEL[kind]
+        _write_memory_edge(
+            conn, source_label, source_id, target_label, target_id,
+            edge_label, now,
+        )
+        out.append({"kind": kind, "target_id": target_id, "target_label": target_label})
+    return out
 
 
 def _expand_neighbors(
@@ -284,6 +409,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         body: str,
         project_hint: str | None = None,
         anchors: list[dict[str, Any]] | None = None,
+        summary: str | None = None,
+        relates_to: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record a durable memory: decision / task / idea / note / summary /
         blocker / fact / episode.
@@ -331,11 +458,30 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         Existing nodes are reused by natural key (sha / (repo,path) / email /
         name). Sparse anchors are accepted — backfill is a client concern.
 
-        Returns: {"id", "node_type", "project_id", "anchored": [...]}.
+        summary: optional ≤200-char title-shaped string surfaced by
+        `list_memories` and `get_memory`. If omitted, those tools fall
+        back to the first 200 chars of body. Validation rejects strings
+        longer than SUMMARY_MAX_LEN — fail at write-time rather than
+        silently truncate. For `kind="note"` the summary writes to the
+        existing `title` column (Note has no parallel summary field).
+
+        relates_to: optional list of memory→memory edges to write. Each
+        entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to",
+        "id": "<existing memory node id>"}. Target ids are validated
+        (must resolve to a memory-bearing node) — bad ids raise
+        ValueError before any state changes.
+
+        Returns: {"id", "node_type", "project_id", "anchored": [...],
+        "related": [...]}.
         """
         if kind not in KIND_TO_LABEL:
             raise ValueError(
                 f"unknown kind '{kind}'. Allowed: {sorted(KIND_TO_LABEL)}"
+            )
+        if summary is not None and len(summary) > SUMMARY_MAX_LEN:
+            raise ValueError(
+                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN}). "
+                "Trim at the call site rather than silently truncating."
             )
         label = KIND_TO_LABEL[kind]
         node_type = NODE_TYPE_BY_KIND[kind]
@@ -359,6 +505,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             body=body,
             kind=kind,
             created_at=now,
+            summary=summary,
         )
 
         # Project anchor: prepend so project shows up in ANCHORED_TO graph too.
@@ -368,6 +515,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         if anchors:
             anchor_list.extend(anchors)
         anchored = apply_anchors(conn, label, node_id, anchor_list, now)
+
+        related: list[dict[str, str]] = []
+        if relates_to:
+            related = _apply_relates_to(conn, label, node_id, relates_to, now)
 
         _insert_embedding_row(
             state,
@@ -385,6 +536,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "node_type": node_type,
             "project_id": project_id,
             "anchored": anchored,
+            "related": related,
         }
 
     @mcp.tool()
@@ -489,6 +641,175 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "label": label,
             "retracted_at": now.isoformat(),
             "reason": reason,
+        }
+
+    @mcp.tool()
+    async def amend(
+        id: str,
+        body: str | None = None,
+        summary: str | None = None,
+        add_anchors: list[dict[str, Any]] | None = None,
+        remove_anchors: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """In-place edit of a memory node. Preserves id; re-embeds when body changes.
+
+        Write tool. Use this when an existing memory needs to be revised —
+        a renamed concept, a sharpened decision, an updated task body.
+        Unlike `record`+`forget`, this keeps the id stable so anchors and
+        any inbound memory→memory edges (RELATES_TO_MEMORY, etc.) keep
+        pointing at the right thing.
+
+        Args:
+          id: the node id returned by `record` / `list_memories`.
+          body: if provided, replaces the stored body AND re-embeds. The
+            old embedding row is deleted and a fresh one inserted, so
+            subsequent `query_memory` calls reflect the new wording.
+          summary: if provided, replaces the stored summary. Pure graph
+            SET — no re-embed (summary is not part of the embedded text).
+            For `kind=note` the value writes to `title`. Validated against
+            SUMMARY_MAX_LEN.
+          add_anchors: list of typed anchor JSON (same shapes as
+            `record`'s `anchors` arg) to add. Idempotent — existing
+            ANCHORED_TO edges are not duplicated.
+          remove_anchors: list of {"target_label", "target_id"} pairs
+            (the shape returned in `record(...)["anchored"]`) to detach.
+            Only the ANCHORED_TO edge is removed; the target node stays.
+
+        Retracted nodes are rejected — to revise a retracted memory,
+        either record a new one or un-retract via direct cypher (not yet
+        a typed mutation).
+
+        Returns: {"id", "node_type", "amended_at", "re_embedded": bool,
+        "added": [...], "removed": [...]}.
+        """
+        if summary is not None and len(summary) > SUMMARY_MAX_LEN:
+            raise ValueError(
+                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})."
+            )
+        if body is None and summary is None and not add_anchors and not remove_anchors:
+            raise ValueError(
+                "amend requires at least one of body / summary / add_anchors / remove_anchors"
+            )
+
+        conn = state.kuzu_conn()
+        label = _lookup_node_label(conn, id)
+        if label is None:
+            raise ValueError(f"no memory node with id={id}")
+
+        # Reject retracted: addressable (get_memory still works) but not editable.
+        retracted_check = conn.execute(
+            f"MATCH (n:{label} {{id: $id}}) RETURN n.retracted_at LIMIT 1",
+            {"id": id},
+        )
+        if retracted_check.has_next() and retracted_check.get_next()[0] is not None:
+            raise ValueError(f"cannot amend retracted node {id}")
+
+        now = _now()
+        fields = _LIST_FIELDS[label]
+        body_field = fields["body_field"]
+        summary_field = fields["summary_field"]
+        node_type = "episode" if label == "Episode" else label.lower()
+
+        re_embedded = False
+        if body is not None:
+            # Note's body lives in `title` and is clipped at SUMMARY_MAX_LEN.
+            stored_body = body[:SUMMARY_MAX_LEN] if label == "Note" else body
+            conn.execute(
+                f"MATCH (n:{label} {{id: $id}}) SET n.{body_field} = $b",
+                {"id": id, "b": stored_body},
+            )
+            # Delete-then-insert in LanceDB. Updating the fixed-size vector
+            # column via `update(values={vector: ...})` is not battle-tested;
+            # the safe path is to drop the old row entirely and re-embed.
+            # Only memory kinds that embed land in LanceDB — Note doesn't
+            # appear in the embeddings table by way of `record`, so a delete
+            # over a missing id is a harmless no-op.
+            try:
+                state.embeddings.delete(f"id = '{id}'")
+            except Exception:
+                pass
+            if label != "Note":
+                vec = await embed(state.http, body)
+                if len(vec) != config.settings.embedding_dim:
+                    raise RuntimeError(
+                        f"embedding dim mismatch: got {len(vec)}, "
+                        f"configured {config.settings.embedding_dim}"
+                    )
+                # project_id is the optional ANCHORED_TO Project — re-derive.
+                pid_res = conn.execute(
+                    f"MATCH (n:{label} {{id: $id}})-[:ANCHORED_TO]->(p:Project) "
+                    f"RETURN p.id LIMIT 1",
+                    {"id": id},
+                )
+                project_id = (
+                    str(pid_res.get_next()[0]) if pid_res.has_next() else None
+                )
+                kind_res = conn.execute(
+                    f"MATCH (n:{label} {{id: $id}}) "
+                    f"RETURN {'n.kind' if label == 'Episode' else 'NULL'} LIMIT 1",
+                    {"id": id},
+                )
+                row = kind_res.get_next() if kind_res.has_next() else [None]
+                stored_kind = row[0] if label == "Episode" else None
+                _insert_embedding_row(
+                    state,
+                    row_id=id,
+                    node_type=node_type,
+                    text=body,
+                    vec=vec,
+                    project_id=project_id,
+                    kind=stored_kind,
+                    created_at=now,
+                )
+                re_embedded = True
+
+        if summary is not None:
+            if summary_field is not None:
+                conn.execute(
+                    f"MATCH (n:{label} {{id: $id}}) SET n.{summary_field} = $s",
+                    {"id": id, "s": summary},
+                )
+            else:
+                # Note: summary writes route to title (clipped).
+                conn.execute(
+                    "MATCH (n:Note {id: $id}) SET n.title = $s",
+                    {"id": id, "s": summary[:SUMMARY_MAX_LEN]},
+                )
+
+        added: list[dict[str, str]] = []
+        if add_anchors:
+            added = apply_anchors(conn, label, id, add_anchors, now)
+
+        removed: list[dict[str, str]] = []
+        if remove_anchors:
+            for spec in remove_anchors:
+                target_label = spec.get("target_label")
+                target_id = spec.get("target_id")
+                if not target_label or not target_id:
+                    raise ValueError(
+                        f"remove_anchors entry needs target_label + target_id: {spec}"
+                    )
+                # Commit uses sha as PK; everything else uses id.
+                pk_field = "sha" if target_label == "Commit" else "id"
+                conn.execute(
+                    f"MATCH (s:{label} {{id: $sid}})-[e:ANCHORED_TO]->"
+                    f"(t:{target_label} {{{pk_field}: $tid}}) DELETE e",
+                    {"sid": id, "tid": target_id},
+                )
+                removed.append({"target_label": target_label, "target_id": target_id})
+
+        conn.execute(
+            f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now",
+            {"id": id, "now": now},
+        )
+
+        return {
+            "id": id,
+            "node_type": node_type,
+            "amended_at": now.isoformat(),
+            "re_embedded": re_embedded,
+            "added": added,
+            "removed": removed,
         }
 
     @mcp.tool()
@@ -757,23 +1078,31 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         fields = _LIST_FIELDS[label]
         ts_field = fields["created_at_field"]
         body_field = fields["body_field"]
+        summary_field = fields["summary_field"]
         node_type = "episode" if label == "Episode" else label.lower()
 
+        summary_select = (
+            f"n.{summary_field}" if summary_field else f"n.{body_field}"
+        )
         result = conn.execute(
             f"MATCH (n:{label} {{id: $id}}) "
             f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project) "
-            f"RETURN n.{body_field}, n.{ts_field}, n.retracted_at, p.id LIMIT 1",
+            f"RETURN n.{body_field} AS body_value, "
+            f"{summary_select} AS stored_summary, n.{ts_field}, "
+            f"n.retracted_at, p.id LIMIT 1",
             {"id": id},
         )
         if not result.has_next():
             return None
-        body_value, created_at, retracted_at, project_id = result.get_next()
+        body_value, stored_summary, created_at, retracted_at, project_id = (
+            result.get_next()
+        )
 
         out: dict[str, Any] = {
             "id": id,
             "node_type": node_type,
             "body": body_value,
-            "summary": _summarize(body_value),
+            "summary": _effective_summary(label, stored_summary, body_value),
             "project_id": project_id,
             "created_at": created_at.isoformat() if created_at is not None else None,
             "retracted_at": (

@@ -434,3 +434,276 @@ async def test_get_memory_works_for_each_kind(tools, fake_embed):
             assert got["body"] == f"body {kind}"
         else:
             assert got["body"] == f"body {kind}"
+
+
+# ----------------- record summary -----------------
+
+
+async def test_record_with_explicit_summary(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](
+        kind="idea",
+        body="a much longer body that says many things and rambles",
+        summary="short hand",
+        project_hint="sp",
+    )
+    got = await fns["get_memory"](id=out["id"])
+    assert got["summary"] == "short hand"
+    assert got["body"].startswith("a much longer body")
+
+
+async def test_record_summary_falls_back_to_body(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="just body", project_hint="sp")
+    got = await fns["get_memory"](id=out["id"])
+    assert got["summary"] == "just body"
+
+
+async def test_record_rejects_oversize_summary(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="summary too long"):
+        await fns["record"](kind="idea", body="b", summary="x" * 201)
+
+
+async def test_record_summary_routes_to_note_title(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](
+        kind="note", body="longer body content", summary="short title"
+    )
+    got = await fns["get_memory"](id=out["id"])
+    # Note has no separate summary column — title IS the summary, and the
+    # explicit summary should win over body-fallback.
+    assert got["body"] == "short title"
+    assert got["summary"] == "short title"
+
+
+# ----------------- relates_to edges on record -----------------
+
+
+async def test_record_relates_to_supersedes_writes_edge(tools, fake_embed):
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="EFD is good", project_hint="rp")
+    b = await fns["record"](
+        kind="idea",
+        body="PFD is the new name",
+        project_hint="rp",
+        relates_to=[{"kind": "supersedes", "id": a["id"]}],
+    )
+    assert b["related"] == [
+        {"kind": "supersedes", "target_id": a["id"], "target_label": "Idea"}
+    ]
+    rows = await fns["cypher"](
+        "MATCH (newer:Idea)-[:SUPERSEDES_MEMORY]->(older:Idea) "
+        "WHERE newer.id = $nid RETURN older.id",
+        {"nid": b["id"]},
+    )
+    assert rows == [[a["id"]]]
+
+
+async def test_record_relates_to_each_kind(tools, fake_embed):
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="base", project_hint="rp")
+    for spec_kind, edge_label in [
+        ("refines", "REFINES"),
+        ("contradicts", "CONTRADICTS"),
+        ("relates_to", "RELATES_TO_MEMORY"),
+    ]:
+        b = await fns["record"](
+            kind="idea",
+            body=f"linked via {spec_kind}",
+            project_hint="rp",
+            relates_to=[{"kind": spec_kind, "id": a["id"]}],
+        )
+        rows = await fns["cypher"](
+            f"MATCH (n:Idea)-[:{edge_label}]->(t:Idea) WHERE n.id = $nid RETURN t.id",
+            {"nid": b["id"]},
+        )
+        assert rows == [[a["id"]]]
+
+
+async def test_record_relates_to_unknown_kind_raises(tools, fake_embed):
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="unknown relates_to kind"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            relates_to=[{"kind": "bogus", "id": a["id"]}],
+        )
+
+
+async def test_record_relates_to_unknown_target_raises(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="not a memory node"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            relates_to=[{"kind": "supersedes", "id": "no-such-id"}],
+        )
+
+
+# ----------------- amend -----------------
+
+
+async def test_amend_body_re_embeds(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="EFD is good", project_hint="ap")
+    res = await fns["amend"](id=out["id"], body="PFD is the renamed concept")
+    assert res["re_embedded"] is True
+    assert res["amended_at"]
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["body"] == "PFD is the renamed concept"
+    # id preserved.
+    assert got["id"] == out["id"]
+
+    # Embedding row exists exactly once for this id with the new text.
+    rows = await fns["query_memory"](query="x", project_hint="ap")
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["text"] == "PFD is the renamed concept"
+
+
+async def test_amend_summary_only_no_re_embed(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="body unchanged", project_hint="ap")
+    call_count_before = fake_embed.call_count
+    res = await fns["amend"](id=out["id"], summary="tight title")
+    assert res["re_embedded"] is False
+    # No new embed call — summary updates don't touch the vector.
+    assert fake_embed.call_count == call_count_before
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["summary"] == "tight title"
+    assert got["body"] == "body unchanged"
+    assert got["retracted_at"] is None
+
+
+async def test_amend_rejects_retracted(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    await fns["forget"](id=out["id"], reason="r")
+    with pytest.raises(ValueError, match="cannot amend retracted"):
+        await fns["amend"](id=out["id"], body="new")
+
+
+async def test_amend_unknown_id_raises(tools):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="no memory node"):
+        await fns["amend"](id="nope", body="x")
+
+
+async def test_amend_requires_at_least_one_change(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="at least one"):
+        await fns["amend"](id=out["id"])
+
+
+async def test_amend_rejects_oversize_summary(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="summary too long"):
+        await fns["amend"](id=out["id"], summary="y" * 201)
+
+
+async def test_amend_add_anchors(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="decision", body="d", project_hint="ap")
+    res = await fns["amend"](
+        id=out["id"],
+        add_anchors=[{"kind": "file", "repo": "r", "path": "x.py"}],
+    )
+    labels = [a["target_label"] for a in res["added"]]
+    assert "File" in labels
+
+    got = await fns["get_memory"](id=out["id"], include_neighbors=True)
+    neighbor_labels = {n["label"] for n in got["neighbors"]}
+    assert "File" in neighbor_labels
+
+
+async def test_amend_remove_anchors(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](
+        kind="decision",
+        body="d",
+        project_hint="ap",
+        anchors=[{"kind": "file", "repo": "r", "path": "x.py"}],
+    )
+    file_anchor = next(a for a in out["anchored"] if a["target_label"] == "File")
+    res = await fns["amend"](
+        id=out["id"],
+        remove_anchors=[
+            {"target_label": "File", "target_id": file_anchor["target_id"]}
+        ],
+    )
+    assert res["removed"] == [
+        {"target_label": "File", "target_id": file_anchor["target_id"]}
+    ]
+
+    got = await fns["get_memory"](id=out["id"], include_neighbors=True)
+    neighbor_labels = {n["label"] for n in got["neighbors"]}
+    assert "File" not in neighbor_labels
+
+
+async def test_amend_preserves_project_anchor_through_re_embed(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="orig", project_hint="ap")
+    await fns["amend"](id=out["id"], body="revised")
+    # project_id must survive the delete-then-insert into LanceDB.
+    rows = await fns["query_memory"](query="x", project_hint="ap")
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["project_id"] == out["project_id"]
+
+
+async def test_amend_episode_preserves_kind_through_re_embed(tools, fake_embed):
+    fns, _ = tools
+    # `kind="fact"` is an Episode flavor; amend must preserve that sub-kind
+    # on the re-inserted embeddings row.
+    out = await fns["record"](kind="fact", body="f", project_hint="ap")
+    await fns["amend"](id=out["id"], body="f2")
+    rows = await fns["query_memory"](query="x", project_hint="ap")
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["kind"] == "fact"
+
+
+# ----------------- EFD→PFD rename, end-to-end (the original incident) -----------------
+
+
+async def test_efd_to_pfd_rename_via_amend(tools, fake_embed):
+    """The triggering pain point: rename an idea while keeping queries finding it."""
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="EFD is good", project_hint="rp")
+    await fns["amend"](
+        id=out["id"], body="PFD is good", summary="PFD (renamed from EFD)"
+    )
+    # id preserved.
+    got = await fns["get_memory"](id=out["id"])
+    assert got["id"] == out["id"]
+    assert got["body"] == "PFD is good"
+    assert got["summary"] == "PFD (renamed from EFD)"
+    # list_memories shows the new summary, not first-of-body.
+    listed = await fns["list_memories"](kind="idea", project_hint="rp")
+    assert listed[0]["summary"] == "PFD (renamed from EFD)"
+
+
+async def test_efd_to_pfd_rename_via_supersedes(tools, fake_embed):
+    """Alternative path when you want both versions discoverable."""
+    fns, _ = tools
+    efd = await fns["record"](kind="idea", body="EFD is good", project_hint="rp")
+    pfd = await fns["record"](
+        kind="idea",
+        body="PFD is good",
+        project_hint="rp",
+        relates_to=[{"kind": "supersedes", "id": efd["id"]}],
+    )
+    await fns["forget"](id=efd["id"], reason="renamed to PFD")
+    # Edge persists across retraction; the graph still shows the lineage.
+    rows = await fns["cypher"](
+        "MATCH (newer:Idea {id: $nid})-[:SUPERSEDES_MEMORY]->(older:Idea) "
+        "RETURN older.id",
+        {"nid": pfd["id"]},
+    )
+    assert rows == [[efd["id"]]]
