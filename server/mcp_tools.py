@@ -21,6 +21,10 @@ MUTATING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Summary length used by list_memories and Note.title clipping. One constant,
+# one rule: summaries are first-N-of-body when not explicitly stored.
+SUMMARY_MAX_LEN = 200
+
 # kind -> (graph_label_or_None, node_type_for_embeddings, embeds?)
 # Episode-flavored kinds become Episode nodes carrying `kind=`.
 KIND_TO_LABEL: dict[str, str] = {
@@ -45,6 +49,30 @@ NODE_TYPE_BY_KIND: dict[str, str] = {
     "blocker": "episode",
     "fact": "episode",
     "episode": "episode",
+}
+
+# Memory-bearing graph labels and the kind string `list_memories`/`query_memory`
+# expose for filtering. Order matches a stable enumeration over the five tables.
+MEMORY_KINDS: tuple[str, ...] = ("decision", "task", "idea", "note", "episode")
+MEMORY_KIND_TO_LABEL: dict[str, str] = {
+    "decision": "Decision",
+    "task": "Task",
+    "idea": "Idea",
+    "note": "Note",
+    "episode": "Episode",
+}
+
+# Per-label MATCH config for `list_memories` / `get_memory`. Each label exposes
+# a `created_at`-shaped timestamp under a different column name, so we project
+# it under a uniform alias. `body_field` is the column whose first
+# SUMMARY_MAX_LEN chars become the summary (Note already stores a title-shaped
+# value, so we read it verbatim).
+_LIST_FIELDS: dict[str, dict[str, str]] = {
+    "Decision": {"created_at_field": "decided_at", "body_field": "body"},
+    "Task":     {"created_at_field": "created_at", "body_field": "body"},
+    "Idea":     {"created_at_field": "created_at", "body_field": "body"},
+    "Note":     {"created_at_field": "created_at", "body_field": "title"},
+    "Episode":  {"created_at_field": "created_at", "body_field": "body"},
 }
 
 
@@ -146,6 +174,81 @@ def _lookup_node_label(conn, node_id: str) -> str | None:
         if result.has_next():
             return label
     return None
+
+
+def _summarize(value: str | None) -> str | None:
+    """Title-shape: first SUMMARY_MAX_LEN chars of value (or None)."""
+    if value is None:
+        return None
+    if len(value) <= SUMMARY_MAX_LEN:
+        return value
+    return value[:SUMMARY_MAX_LEN]
+
+
+def _list_one_label(
+    conn,
+    label: str,
+    *,
+    project_id: str | None,
+    include_retracted: bool,
+) -> list[dict[str, Any]]:
+    """Return raw rows for one memory label. Sort + slice happen in Python."""
+    fields = _LIST_FIELDS[label]
+    ts_field = fields["created_at_field"]
+    body_field = fields["body_field"]
+    node_type = "episode" if label == "Episode" else label.lower()
+
+    clauses: list[str] = []
+    if not include_retracted:
+        clauses.append("n.retracted_at IS NULL")
+
+    params: dict[str, Any] = {}
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    if project_id is not None:
+        # Filter to a known project; we already know its id, no need to re-project.
+        match_clause = (
+            f"MATCH (n:{label})-[:ANCHORED_TO]->(p:Project {{id: $pid}}){where}"
+        )
+        params["pid"] = project_id
+        return_project_clause = "$pid AS pid"
+    else:
+        # No filter — OPTIONAL MATCH so nodes without a Project anchor still appear.
+        # WHERE must precede OPTIONAL MATCH in Kuzu; placing it after binds to
+        # the optional pattern and silently nulls out p.id when the WHERE clause
+        # is supposed to constrain n only.
+        match_clause = (
+            f"MATCH (n:{label}){where} "
+            f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project)"
+        )
+        return_project_clause = "p.id AS pid"
+
+    query = (
+        f"{match_clause} "
+        f"RETURN n.id, n.{body_field}, n.{ts_field}, n.retracted_at, "
+        f"{return_project_clause}"
+    )
+    result = conn.execute(query, params)
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    while result.has_next():
+        node_id, body_value, created_at, retracted_at, pid = result.get_next()
+        # OPTIONAL MATCH can yield duplicates if a node has multiple Project
+        # anchors. Dedup keeping first hit — project_id is informational, not
+        # canonical (the graph holds the full set).
+        if node_id in seen_ids:
+            continue
+        seen_ids.add(node_id)
+        rows.append(
+            {
+                "id": node_id,
+                "node_type": node_type,
+                "summary": _summarize(body_value),
+                "project_id": pid,
+                "created_at": created_at,
+                "retracted_at": retracted_at,
+            }
+        )
+    return rows
 
 
 def _expand_neighbors(
@@ -396,6 +499,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         expand_hops: int = 1,
         include_retracted: bool = False,
         node_types: list[str] | None = None,
+        snippet_chars: int = 0,
     ) -> list[dict[str, Any]]:
         """Semantic search + 1-hop graph expansion over recorded memory.
 
@@ -423,6 +527,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             entries.
           node_types: filter by node_type list, e.g. ["decision","task"].
             Allowed values: "decision","task","idea","note","episode".
+          snippet_chars: 0 (default) returns full body text; >0 truncates
+            each hit's text to that many chars with a trailing ellipsis.
+            Use a small value (e.g. 240) when you only need a preview and
+            want to keep the MCP output budget small.
 
         Returns: [{"hit": {id,text,kind,node_type,project_id,score,created_at,
         retracted_at}, "neighbors": [{label, ...identifying fields}]}].
@@ -457,9 +565,12 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 if node_type == "episode"
                 else node_type.capitalize()
             )
+            text_value = record_row["text"]
+            if snippet_chars > 0 and text_value is not None and len(text_value) > snippet_chars:
+                text_value = text_value[:snippet_chars] + "…"
             hit = {
                 "id": node_id,
-                "text": record_row["text"],
+                "text": text_value,
                 "kind": record_row.get("kind"),
                 "node_type": node_type,
                 "project_id": record_row.get("project_id"),
@@ -524,3 +635,151 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         while result.has_next():
             rows.append([_coerce(v) for v in result.get_next()])
         return rows
+
+    @mcp.tool()
+    async def list_memories(
+        kind: str | None = None,
+        project_hint: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        order_by: str = "created_at_desc",
+        include_retracted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Enumerate memory nodes without semantic ranking. Returns summaries.
+
+        Read tool (enumeration). The third navigation primitive alongside
+        `query_memory` (semantic) and `cypher` (structural). Use when you
+        want to see *what's in here* without a query in mind — e.g. "what
+        ideas do I have on project X?", "what tasks are open?".
+
+        Bodies are NOT returned. Each row carries a `summary` (first ~200
+        chars of body, or for Note the existing title). Use `get_memory`
+        with a returned id to pull a full body when needed.
+
+        Args:
+          kind: one of "decision","task","idea","note","episode" (or None
+            for all). Episode-flavored kinds (summary/blocker/fact) all
+            live under "episode" here — use `query_memory` with node_types
+            for sub-kind discrimination.
+          project_hint: project NAME (not id). Filters via ANCHORED_TO
+            Project edge. If the project name doesn't exist, returns [].
+          limit: max rows returned (default 50). Applied after sort.
+          offset: rows to skip (default 0). For paging.
+          order_by: "created_at_desc" (default) | "created_at_asc".
+          include_retracted: default False; pass True to include
+            soft-deleted entries.
+
+        Returns: [{id, node_type, summary, project_id, created_at,
+        retracted_at}]. created_at/retracted_at are ISO strings or None.
+        """
+        if kind is not None and kind not in MEMORY_KIND_TO_LABEL:
+            raise ValueError(
+                f"unknown kind '{kind}'. Allowed: {sorted(MEMORY_KIND_TO_LABEL)} or None"
+            )
+        if order_by not in ("created_at_desc", "created_at_asc"):
+            raise ValueError(
+                f"unknown order_by '{order_by}'. Allowed: created_at_desc | created_at_asc"
+            )
+
+        conn = state.kuzu_conn()
+
+        if project_hint is not None:
+            result = conn.execute(
+                "MATCH (p:Project {name: $n}) RETURN p.id LIMIT 1",
+                {"n": project_hint},
+            )
+            if not result.has_next():
+                return []
+            project_id: str | None = str(result.get_next()[0])
+        else:
+            project_id = None
+
+        labels = (
+            [MEMORY_KIND_TO_LABEL[kind]] if kind is not None else
+            [MEMORY_KIND_TO_LABEL[k] for k in MEMORY_KINDS]
+        )
+
+        all_rows: list[dict[str, Any]] = []
+        for label in labels:
+            all_rows.extend(
+                _list_one_label(
+                    conn,
+                    label,
+                    project_id=project_id,
+                    include_retracted=include_retracted,
+                )
+            )
+
+        # Sort, then page. Rows with NULL created_at sort to the end either way.
+        reverse = order_by == "created_at_desc"
+        all_rows.sort(
+            key=lambda r: (r["created_at"] is None, r["created_at"] or datetime.min),
+            reverse=reverse,
+        )
+        sliced = all_rows[offset : offset + limit]
+
+        for row in sliced:
+            row["created_at"] = (
+                row["created_at"].isoformat() if row["created_at"] is not None else None
+            )
+            row["retracted_at"] = (
+                row["retracted_at"].isoformat()
+                if row["retracted_at"] is not None
+                else None
+            )
+        return sliced
+
+    @mcp.tool()
+    async def get_memory(
+        id: str,
+        include_neighbors: bool = False,
+    ) -> dict[str, Any] | None:
+        """Fetch a memory node by id. Returns full body + metadata, or None.
+
+        Read tool. Use when you have an id (e.g. from `list_memories`,
+        `record`, or a prior `query_memory` hit) and want the full body
+        without re-running a semantic query. Retracted nodes ARE returned
+        with `retracted_at` populated — addressable even when not editable.
+
+        Args:
+          id: the node id returned by `record` / `list_memories` / etc.
+          include_neighbors: if True, also returns 1-hop ANCHORED_TO
+            neighbors (same shape as `query_memory` neighbors).
+
+        Returns: {id, node_type, body, summary, project_id, created_at,
+        retracted_at, neighbors?} or None if no memory has that id.
+        """
+        conn = state.kuzu_conn()
+        label = _lookup_node_label(conn, id)
+        if label is None:
+            return None
+
+        fields = _LIST_FIELDS[label]
+        ts_field = fields["created_at_field"]
+        body_field = fields["body_field"]
+        node_type = "episode" if label == "Episode" else label.lower()
+
+        result = conn.execute(
+            f"MATCH (n:{label} {{id: $id}}) "
+            f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project) "
+            f"RETURN n.{body_field}, n.{ts_field}, n.retracted_at, p.id LIMIT 1",
+            {"id": id},
+        )
+        if not result.has_next():
+            return None
+        body_value, created_at, retracted_at, project_id = result.get_next()
+
+        out: dict[str, Any] = {
+            "id": id,
+            "node_type": node_type,
+            "body": body_value,
+            "summary": _summarize(body_value),
+            "project_id": project_id,
+            "created_at": created_at.isoformat() if created_at is not None else None,
+            "retracted_at": (
+                retracted_at.isoformat() if retracted_at is not None else None
+            ),
+        }
+        if include_neighbors:
+            out["neighbors"] = _expand_neighbors(conn, label, id, 1)
+        return out
