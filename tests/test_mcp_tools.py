@@ -52,7 +52,9 @@ async def test_record_decision_roundtrip(tools, fake_embed):
     labels = [a["target_label"] for a in stored["anchored"]]
     assert "Project" in labels
 
-    rows = await fns["query_memory"](query="anything", project_hint="proj1")
+    rows = await fns["query_memory"](
+        query="anything", project_hint="proj1", expand_hops=1
+    )
     assert len(rows) == 1
     assert rows[0]["hit"]["text"].startswith("Pick Kuzu")
     assert rows[0]["hit"]["node_type"] == "decision"
@@ -96,7 +98,9 @@ async def test_record_with_file_anchor_creates_link(tools, fake_embed):
     labels = sorted(a["target_label"] for a in out["anchored"])
     assert labels == ["File", "Project"]
 
-    rows = await fns["query_memory"](query="x", project_hint="alpha")
+    rows = await fns["query_memory"](
+        query="x", project_hint="alpha", expand_hops=1
+    )
     assert len(rows) == 1
     neighbors = {n["label"] for n in rows[0]["neighbors"]}
     assert "File" in neighbors
@@ -247,27 +251,42 @@ async def test_embedding_dim_mismatch_raises(tools):
             await fns["record"](kind="note", body="x")
 
 
-# ----------------- query_memory snippet_chars -----------------
+# ----------------- query_memory defaults: snippet_chars=240, expand_hops=0 -----------------
 
 
-async def test_query_memory_default_returns_full_body(tools, fake_embed):
+async def test_query_memory_default_truncates_long_body(tools, fake_embed):
+    """Default snippet_chars=240 means long bodies come back clipped."""
     fns, _ = tools
     long_body = "x" * 1000
     await fns["record"](kind="idea", body=long_body, project_hint="sp")
     rows = await fns["query_memory"](query="x", project_hint="sp")
-    assert rows[0]["hit"]["text"] == long_body
+    text = rows[0]["hit"]["text"]
+    assert text.endswith("…")
+    assert len(text) == 241  # 240 chars + ellipsis
 
 
-async def test_query_memory_snippet_chars_truncates(tools, fake_embed):
+async def test_query_memory_default_no_neighbors(tools, fake_embed):
+    """Default expand_hops=0 means neighbors come back empty."""
+    fns, _ = tools
+    await fns["record"](
+        kind="decision",
+        body="d",
+        project_hint="sp",
+        anchors=[{"kind": "file", "repo": "r", "path": "x.py"}],
+    )
+    rows = await fns["query_memory"](query="x", project_hint="sp")
+    assert rows[0]["neighbors"] == []
+
+
+async def test_query_memory_snippet_chars_zero_returns_full_body(tools, fake_embed):
+    """snippet_chars=0 is the explicit opt-out for full bodies."""
     fns, _ = tools
     long_body = "x" * 1000
     await fns["record"](kind="idea", body=long_body, project_hint="sp")
     rows = await fns["query_memory"](
-        query="x", project_hint="sp", snippet_chars=240
+        query="x", project_hint="sp", snippet_chars=0
     )
-    text = rows[0]["hit"]["text"]
-    assert text.endswith("…")
-    assert len(text) == 241  # 240 chars + ellipsis
+    assert rows[0]["hit"]["text"] == long_body
 
 
 async def test_query_memory_snippet_chars_no_op_when_shorter(tools, fake_embed):
@@ -277,6 +296,14 @@ async def test_query_memory_snippet_chars_no_op_when_shorter(tools, fake_embed):
         query="x", project_hint="sp", snippet_chars=240
     )
     assert rows[0]["hit"]["text"] == "short"  # no ellipsis added
+
+
+async def test_query_memory_expand_hops_rejects_multi_hop(tools, fake_embed):
+    """expand_hops > 1 was a silent no-op; now it's a loud ValueError."""
+    fns, _ = tools
+    await fns["record"](kind="idea", body="x", project_hint="sp")
+    with pytest.raises(ValueError, match="expand_hops must be 0 or 1"):
+        await fns["query_memory"](query="x", project_hint="sp", expand_hops=2)
 
 
 # ----------------- list_memories -----------------

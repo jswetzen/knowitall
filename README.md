@@ -35,8 +35,11 @@ over your LAN/VPN with a bearer token.
 
 | Tool | Purpose |
 |---|---|
-| `record(kind, body, project_hint, anchors)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, episode}. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. |
-| `query_memory(query, project_hint, k, expand_hops, include_retracted, node_types)` | Semantic search + 1-hop ANCHORED_TO neighbor expansion. Returns `[{hit, neighbors}]`. |
+| `record(kind, body, project_hint, anchors, summary, relates_to)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, episode}. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. Optional `summary` is a ≤200-char title-shaped string (falls back to first 200 of body). Optional `relates_to` writes memory→memory edges (kinds: supersedes/refines/contradicts/relates_to). |
+| `query_memory(query, project_hint, k, expand_hops=0, snippet_chars=240, include_retracted, node_types)` | Semantic search. Defaults: bodies clipped to 240 chars + ellipsis, no neighbor expansion. Pass `expand_hops=1` for ANCHORED_TO neighbors; pass `snippet_chars=0` for full bodies. |
+| `list_memories(kind, project_hint, limit, offset, order_by, include_retracted)` | Enumerate memories without semantic ranking. Returns summaries only; use `get_memory` to fetch full bodies. |
+| `get_memory(id, include_neighbors)` | Fetch a memory by id. Returns full body + summary + metadata. Surfaces retracted nodes with `retracted_at` populated. |
+| `amend(id, body, summary, add_anchors, remove_anchors)` | In-place edit preserving id. Body changes trigger re-embed; summary updates skip it. Rejects retracted nodes. |
 | `update_todo(id, status, anchors)` | Transition a Task's status. Done + commit anchor also writes `CLOSED_BY`. |
 | `forget(id, reason)` | Soft undo — sets `retracted_at`; default queries hide it. |
 | `cypher(query, params)` | Read-only Cypher passthrough over the graph. |

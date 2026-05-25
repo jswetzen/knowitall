@@ -817,17 +817,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         query: str,
         project_hint: str | None = None,
         k: int = 10,
-        expand_hops: int = 1,
+        expand_hops: int = 0,
         include_retracted: bool = False,
         node_types: list[str] | None = None,
-        snippet_chars: int = 0,
+        snippet_chars: int = 240,
     ) -> list[dict[str, Any]]:
-        """Semantic search + 1-hop graph expansion over recorded memory.
+        """Semantic search over recorded memory; optional 1-hop graph expansion.
 
         Read tool. Retrieves passages recorded via `record`, ranks by
-        embedding distance, and (when expand_hops>=1) attaches each hit's
-        ANCHORED_TO neighbors so you see the cited commits/files/symbols/
-        concepts/people alongside the body.
+        embedding distance. By default returns truncated text and no
+        neighbors — both are opt-in to keep the MCP output budget small.
 
         When to call:
           - The user asks "where is X at?" / "what did we decide about Y?"
@@ -842,21 +841,27 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
           project_hint: project NAME (not id). Restricts to that project's
             embedding rows. If the project name doesn't exist, returns [].
           k: top-k hits to return (default 10).
-          expand_hops: 0 disables neighbor expansion, 1 (default) includes
-            outbound ANCHORED_TO targets.
+          expand_hops: 0 (default) skips neighbor expansion entirely; 1
+            includes outbound ANCHORED_TO targets. Values >1 are rejected
+            (the multi-hop walk was never implemented — set to 1 if you
+            want neighbors, or use `cypher` for deeper traversal).
           include_retracted: default False; pass True to include soft-deleted
             entries.
           node_types: filter by node_type list, e.g. ["decision","task"].
             Allowed values: "decision","task","idea","note","episode".
-          snippet_chars: 0 (default) returns full body text; >0 truncates
-            each hit's text to that many chars with a trailing ellipsis.
-            Use a small value (e.g. 240) when you only need a preview and
-            want to keep the MCP output budget small.
+          snippet_chars: 240 (default) truncates each hit's text to that
+            many chars with a trailing ellipsis. Pass 0 for full bodies
+            (use `get_memory(id)` for a single full body without a query).
 
         Returns: [{"hit": {id,text,kind,node_type,project_id,score,created_at,
         retracted_at}, "neighbors": [{label, ...identifying fields}]}].
-        Lower score == closer match.
+        Lower score == closer match. When expand_hops=0, "neighbors" is [].
         """
+        if expand_hops not in (0, 1):
+            raise ValueError(
+                f"expand_hops must be 0 or 1, got {expand_hops}. "
+                "Multi-hop traversal is not implemented; use cypher for it."
+            )
         vec = await embed(state.http, query)
         conn = state.kuzu_conn()
 
