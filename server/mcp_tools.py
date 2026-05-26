@@ -88,6 +88,15 @@ MEMORY_EDGE_KIND_TO_LABEL: dict[str, str] = {
     "refines":     "REFINES",
     "contradicts": "CONTRADICTS",
     "relates_to":  "RELATES_TO_MEMORY",
+    "blocks":      "BLOCKS",
+}
+
+# `relates_to` kinds with endpoint constraints. Absence from this dict means
+# any memory-bearing label is allowed on both sides. BLOCKS is Task→Task only
+# because that's how the v1 edge is declared in the schema; widening it would
+# need a destructive DROP+CREATE.
+MEMORY_EDGE_ENDPOINTS: dict[str, tuple[set[str], set[str]]] = {
+    "blocks": ({"Task"}, {"Task"}),
 }
 
 
@@ -369,6 +378,15 @@ def _apply_relates_to(
             raise ValueError(
                 f"relates_to target {target_id!r} is not a memory node"
             )
+        endpoints = MEMORY_EDGE_ENDPOINTS.get(kind)
+        if endpoints is not None:
+            allowed_from, allowed_to = endpoints
+            if source_label not in allowed_from or target_label not in allowed_to:
+                raise ValueError(
+                    f"relates_to kind {kind!r} requires "
+                    f"{sorted(allowed_from)}→{sorted(allowed_to)}, got "
+                    f"{source_label}→{target_label}"
+                )
         edge_label = MEMORY_EDGE_KIND_TO_LABEL[kind]
         _write_memory_edge(
             conn, source_label, source_id, target_label, target_id,
@@ -493,10 +511,12 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         existing `title` column (Note has no parallel summary field).
 
         relates_to: optional list of memory→memory edges to write. Each
-        entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to",
-        "id": "<existing memory node id>"}. Target ids are validated
-        (must resolve to a memory-bearing node) — bad ids raise
-        ValueError before any state changes.
+        entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to"|
+        "blocks", "id": "<existing memory node id>"}. Target ids are
+        validated (must resolve to a memory-bearing node) — bad ids
+        raise ValueError before any state changes. "blocks" additionally
+        requires both endpoints be Task nodes (the underlying BLOCKS
+        edge is Task→Task only).
 
         Returns: {"id", "node_type", "project_id", "anchored": [...],
         "related": [...]}.
@@ -972,28 +992,40 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
     async def cypher(
         query: str, params: dict[str, Any] | None = None
     ) -> list[list[Any]]:
-        """Read-only Kùzu Cypher passthrough — graph queries against the v2 schema.
+        """Read-only Kùzu Cypher passthrough — graph queries against the v3 schema.
 
-        Read tool (structural). Use for who/what/when over the graph (authors,
-        commits, files, projects, anchor links). Use `query_memory` for free-
-        text semantic recall.
+        Read tool (structural). Use for who/what/when over the graph (anchor
+        links, supersedes/refines/blocks chains, closed-by-commit). Use
+        `query_memory` for free-text semantic recall.
 
-        v2 schema additions on top of v0/v1:
-          Nodes: Episode(id, body, kind, created_at, model_version, retracted_at).
-          Retracted_at columns on Decision, Task, Idea, Note.
-          Edges: ANCHORED_TO (bi-temporal generic citation) from Episode |
-            Decision | Task | Idea | Note → Commit | File | Symbol | Project |
-            Concept | Person.
+        Nodes (memory-bearing): Episode, Decision, Task, Idea, Note.
+          All carry: id, retracted_at, amended_at. Decision/Task/Idea/
+          Episode also have a `summary` column; Note uses `title`.
+        Nodes (anchor targets): Project, Commit, File, Symbol, Concept,
+          Person, Repo.
 
-        Carried over from v0/v1: Project, Repo, Commit, File, Symbol, Note,
-        Conversation, Decision, Concept, Person, Task, Idea. Edges PART_OF,
-        IN_REPO, AUTHORED, MODIFIED, DEFINED_IN, CALLS, IMPORTS, DEPENDS_ON,
-        BLOCKS, SUPERSEDES, GRADUATED_TO, ALIAS_OF, RELATES_TO, DECIDED_IN,
-        DROPPED, CLOSED_BY, TOUCHED_BY, BELONGS_TO, MENTIONED_IN.
+        Edges currently WRITTEN by the MCP tools (these have data):
+          - ANCHORED_TO: memory → {Project|Commit|File|Symbol|Concept|Person}.
+            Generic citation. Written by `record(anchors=)`,
+            `amend(add_anchors=)`, `update_todo(anchors=)`.
+          - SUPERSEDES_MEMORY, REFINES, CONTRADICTS, RELATES_TO_MEMORY:
+            memory → memory. Written by `record(relates_to=...)`.
+          - BLOCKS: Task → Task. Written by `record(relates_to=[{
+            "kind":"blocks", "id":...}])` when both endpoints are Tasks.
+          - CLOSED_BY: Task → Commit. Written by `update_todo(status=
+            "done", anchors=[{"kind":"commit", "sha":...}])`.
+
+        Edges declared in the schema but NOT YET WRITTEN by any tool
+        (querying them returns empty until ingestion lands): PART_OF,
+        IN_REPO, AUTHORED, MODIFIED, DEFINED_IN, CALLS, IMPORTS,
+        DEPENDS_ON, GRADUATED_TO, ALIAS_OF, RELATES_TO (Concept→Concept),
+        DECIDED_IN, DROPPED, TOUCHED_BY, BELONGS_TO, MENTIONED_IN, and
+        the v1 SUPERSEDES (Decision→Decision; superseded by
+        SUPERSEDES_MEMORY).
 
         Mutating keywords (CREATE/MERGE/DELETE/SET/DROP/REMOVE/DETACH/COPY/
         ALTER/INSTALL/LOAD/ATTACH/CALL) are rejected. Writes go through
-        `record`, `update_todo`, or `forget`.
+        `record`, `amend`, `update_todo`, or `forget`.
 
         Example: `MATCH (d:Decision)-[:ANCHORED_TO]->(f:File)
                   RETURN d.body, f.path`.

@@ -569,6 +569,51 @@ async def test_record_relates_to_unknown_target_raises(tools, fake_embed):
         )
 
 
+async def test_record_relates_to_blocks_writes_typed_edge(tools, fake_embed):
+    # Task→Task blocks should write the v1 BLOCKS edge, not the generic
+    # RELATES_TO_MEMORY. This is what `relates_to: kind="blocks"` exists for.
+    fns, _ = tools
+    blocker = await fns["record"](kind="task", body="upgrade db", project_hint="bp")
+    blocked = await fns["record"](
+        kind="task",
+        body="migrate schema",
+        project_hint="bp",
+        relates_to=[{"kind": "blocks", "id": blocker["id"]}],
+    )
+    assert blocked["related"] == [
+        {"kind": "blocks", "target_id": blocker["id"], "target_label": "Task"}
+    ]
+    rows = await fns["cypher"](
+        "MATCH (s:Task)-[:BLOCKS]->(t:Task) WHERE s.id = $sid RETURN t.id",
+        {"sid": blocked["id"]},
+    )
+    assert rows == [[blocker["id"]]]
+
+
+async def test_record_relates_to_blocks_rejects_non_task_source(tools, fake_embed):
+    fns, _ = tools
+    target = await fns["record"](kind="task", body="t", project_hint="bp")
+    with pytest.raises(ValueError, match="requires.*Task.*Task"):
+        await fns["record"](
+            kind="idea",
+            body="not a task",
+            project_hint="bp",
+            relates_to=[{"kind": "blocks", "id": target["id"]}],
+        )
+
+
+async def test_record_relates_to_blocks_rejects_non_task_target(tools, fake_embed):
+    fns, _ = tools
+    target = await fns["record"](kind="idea", body="i", project_hint="bp")
+    with pytest.raises(ValueError, match="requires.*Task.*Task"):
+        await fns["record"](
+            kind="task",
+            body="t",
+            project_hint="bp",
+            relates_to=[{"kind": "blocks", "id": target["id"]}],
+        )
+
+
 # ----------------- amend -----------------
 
 
