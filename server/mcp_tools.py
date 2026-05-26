@@ -35,6 +35,7 @@ KIND_TO_LABEL: dict[str, str] = {
     "summary": "Episode",
     "blocker": "Episode",
     "fact": "Episode",
+    "solution": "Episode",
     "episode": "Episode",
 }
 
@@ -48,6 +49,7 @@ NODE_TYPE_BY_KIND: dict[str, str] = {
     "summary": "episode",
     "blocker": "episode",
     "fact": "episode",
+    "solution": "episode",
     "episode": "episode",
 }
 
@@ -413,18 +415,26 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         relates_to: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record a durable memory: decision / task / idea / note / summary /
-        blocker / fact / episode.
+        blocker / fact / solution / episode.
 
         Write tool. One polymorphic entry point — pick `kind` per the taxonomy
         below; the server creates the right graph node and a matching embedding
         row so future `query_memory` calls can find it semantically.
 
-        Use this when something would be useful in a FUTURE Claude Code session,
+        Memories are SHARED across every AI tool connected to this knowitall
+        server (Claude Code, Codex, Cursor, etc.). Write for the next agent
+        — possibly running in a different tool — not just for future-you in
+        this session.
+
+        Use this when something would be useful in a FUTURE session,
         after the current context window is gone. Good triggers:
           - The user states something durable about themselves or the project
             ("we always do X", "next we want Y", "Z is the blocker").
           - A design decision is made — capture the choice AND the rationale.
           - A bug is tracked down — capture the root cause and the fix.
+          - A tricky env/setup/import/config issue was resolved — capture it
+            as `kind="solution"`. Future-you (or another AI tool) WILL hit
+            this again; the lookup is only useful if the entry is findable.
           - A feature is finished — capture what was built.
           - Session is wrapping up: proactively ASK before storing a `summary`.
 
@@ -435,8 +445,25 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         kind taxonomy:
           - "decision" | "task" | "idea" | "note": become first-class graph
             nodes (citable, expandable, can be the target of edges).
-          - "summary" | "blocker" | "fact" | "episode": become Episode nodes
-            carrying the kind, for less structural / more narrative content.
+          - "summary" | "blocker" | "fact" | "solution" | "episode": become
+            Episode nodes carrying the kind, for less structural / more
+            narrative content.
+
+        kind="solution" body shape (FOLLOW THIS — semantic retrieval depends
+        on it):
+          Line 1: the verbatim error string or exact symptom (paste it,
+                  don't paraphrase). This is what future-you will search.
+          Line 2: the command / context that surfaces it.
+          Body:   the fix, and how you verified it worked.
+          Last line: `Discoverable keywords: <3-5 paraphrases the future
+                  searcher might type>` — embedding models cluster on
+                  lexical neighbors, so paraphrases on the page widen
+                  the recall surface.
+        After recording, run `query_memory` with the symptom phrasing you
+        expect future-you to use. If your entry isn't top-1, amend the body
+        until it is. If a similar solution already exists, `amend` it
+        instead of recording a duplicate — duplicates split the embedding
+        signal and bury the right answer.
 
         body: self-contained prose. Must be readable without surrounding chat.
 
@@ -828,13 +855,34 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         embedding distance. By default returns truncated text and no
         neighbors — both are opt-in to keep the MCP output budget small.
 
+        Memory is shared across every AI tool connected to this knowitall
+        server, so a fix discovered in one tool is recoverable from any
+        other — but only if you search for it.
+
         When to call:
           - The user asks "where is X at?" / "what did we decide about Y?"
           - Session start when the user references prior work.
           - Before saying you don't know something project-specific.
 
+        Search PROACTIVELY (not just when the user asks) when:
+          - You hit an env / import / setup / config / dependency error and
+            are about to attempt a second fix. Paste the LITERAL error
+            string as the query — exact tokens beat paraphrases.
+          - The user asks to "get X working" / "set up X" / "run X
+            locally" for an existing project. Before starting, run
+            `list_memories(project_hint=X, kind="episode")` once to
+            surface known gotchas without needing the right query.
+          - You're about to recommend a non-obvious workaround. Check
+            whether a solution memory already covers it.
+
+        Hygiene: if a hit names a specific file, function, or flag,
+        VERIFY it still exists (grep, read) before recommending. Memory
+        can outlive the code it references.
+
         Phrasing tip: noun phrases beat questions. "auth service location"
-        beats "where is the auth service".
+        beats "where is the auth service". For solution lookups, paste
+        the verbatim error message — that's what the writer was supposed
+        to lead with.
 
         Args:
           query: free-text. Embedded; ranked by vector distance.

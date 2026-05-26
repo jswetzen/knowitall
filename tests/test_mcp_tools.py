@@ -696,6 +696,26 @@ async def test_amend_episode_preserves_kind_through_re_embed(tools, fake_embed):
     assert matching[0]["hit"]["kind"] == "fact"
 
 
+async def test_solution_kind_round_trips_as_episode(tools, fake_embed):
+    # `kind="solution"` is an Episode flavor — it must store, embed, list,
+    # and amend the same way other Episode kinds do, with `kind="solution"`
+    # surfaced on the embedding row for node_type filtering.
+    fns, _ = tools
+    out = await fns["record"](
+        kind="solution",
+        body="ModuleNotFoundError: No module named 'foo'\npoetry install fixes it",
+        project_hint="sp",
+    )
+    assert out["node_type"] == "episode"
+    rows = await fns["query_memory"](query="x", project_hint="sp")
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["kind"] == "solution"
+    # list_memories enumerates Episode-flavored entries under kind="episode".
+    listed = await fns["list_memories"](kind="episode", project_hint="sp")
+    assert any(r["id"] == out["id"] for r in listed)
+
+
 # ----------------- EFD→PFD rename, end-to-end (the original incident) -----------------
 
 

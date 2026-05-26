@@ -11,9 +11,16 @@ long-running project. knowitall is the layer that remembers, so you can ask
 Claude already know what X is, which repo it lives in, what was last
 decided, and what else it touches.
 
+Multiple AI tools (Claude Code, Codex, Cursor, …) connected to the same
+knowitall instance share decisions, tasks, and solutions — so a fix
+discovered in one tool isn't lost when you switch to another. Per-tool
+auto-memory (e.g. Claude Code's `MEMORY.md`) still handles tool-specific
+working preferences; knowitall is the cross-tool engineering layer.
+
 Not a chatbot personalization layer (mem0). Not an agent framework
-(Letta/MemGPT). Not pure vector RAG. Engineering memory for an IDE
-assistant — graph + vector, with code and decisions as first-class nodes.
+(Letta/MemGPT). Not pure vector RAG. Engineering memory for IDE
+assistants — graph + vector, with code, decisions, and solutions as
+first-class nodes.
 
 ## What
 
@@ -35,7 +42,7 @@ over your LAN/VPN with a bearer token.
 
 | Tool | Purpose |
 |---|---|
-| `record(kind, body, project_hint, anchors, summary, relates_to)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, episode}. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. Optional `summary` is a ≤200-char title-shaped string (falls back to first 200 of body). Optional `relates_to` writes memory→memory edges (kinds: supersedes/refines/contradicts/relates_to). |
+| `record(kind, body, project_hint, anchors, summary, relates_to)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, solution, episode}. `solution` is for env/setup/config gotchas — lead the body with the verbatim error string. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. Optional `summary` is a ≤200-char title-shaped string (falls back to first 200 of body). Optional `relates_to` writes memory→memory edges (kinds: supersedes/refines/contradicts/relates_to). |
 | `query_memory(query, project_hint, k, expand_hops=0, snippet_chars=240, include_retracted, node_types)` | Semantic search. Defaults: bodies clipped to 240 chars + ellipsis, no neighbor expansion. Pass `expand_hops=1` for ANCHORED_TO neighbors; pass `snippet_chars=0` for full bodies. |
 | `list_memories(kind, project_hint, limit, offset, order_by, include_retracted)` | Enumerate memories without semantic ranking. Returns summaries only; use `get_memory` to fetch full bodies. |
 | `get_memory(id, include_neighbors)` | Fetch a memory by id. Returns full body + summary + metadata. Surfaces retracted nodes with `retracted_at` populated. |
