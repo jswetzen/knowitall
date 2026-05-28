@@ -232,6 +232,39 @@ async def test_query_memory_anchor_hint_validates_kind(tools, fake_embed):
         )
 
 
+async def test_project_hint_emits_deprecation_warning(tools, fake_embed):
+    """Legacy alias still works but nudges callers to migrate."""
+    import warnings as _w
+
+    fns, _ = tools
+    await fns["record"](kind="note", body="x", project_hint="dep-test")
+
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        await fns["query_memory"](query="x", project_hint="dep-test")
+
+    dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert dep, "expected DeprecationWarning from project_hint"
+    assert "anchor_hint" in str(dep[0].message)
+
+
+async def test_anchor_hint_does_not_warn(tools, fake_embed):
+    import warnings as _w
+
+    fns, _ = tools
+    await fns["record"](kind="note", body="x", project_hint="quiet-test")
+
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        await fns["query_memory"](
+            query="x",
+            anchor_hint={"kind": "project", "name": "quiet-test"},
+        )
+
+    dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert not dep, f"unexpected DeprecationWarning(s): {[str(d.message) for d in dep]}"
+
+
 async def test_list_memories_anchor_hint_concept(tools, fake_embed):
     fns, _ = tools
     await fns["record"](

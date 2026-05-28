@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -276,7 +277,9 @@ def _coerce_legacy_project_hint(
 
     project_hint is the v3 spelling; anchor_hint is the v4 generalization.
     Passing both is an error — callers must pick one. Passing project_hint
-    alone is auto-rewritten to {"kind":"project","name":project_hint}.
+    alone is auto-rewritten to {"kind":"project","name":project_hint} and
+    emits a DeprecationWarning so callers migrate before the alias is
+    removed.
     """
     if project_hint is not None and anchor_hint is not None:
         raise ValueError(
@@ -284,6 +287,13 @@ def _coerce_legacy_project_hint(
             "project_hint is the deprecated alias."
         )
     if project_hint is not None:
+        warnings.warn(
+            "project_hint is deprecated; pass "
+            'anchor_hint={"kind":"project","name":<hint>} instead. '
+            "project_hint will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
         return {"kind": "project", "name": project_hint}
     return anchor_hint
 
