@@ -119,6 +119,146 @@ async def test_project_filter_excludes_others(tools, fake_embed):
     assert texts == ["in proj1"]
 
 
+# ----------------- anchor_hint: cross-anchored / library knowledge -----------
+
+
+async def test_query_memory_finds_multi_project_anchored(tools, fake_embed):
+    """A memory anchored to several Projects must surface under each hint.
+
+    This is the core library-knowledge case: a recipe written once and
+    anchored to every consumer project should be discoverable from any of
+    them — without the writer having to duplicate the entry per repo.
+    """
+    fns, _ = tools
+    stored = await fns["record"](
+        kind="note",
+        body="mycelium configure_logging snippet",
+        project_hint="mycelium",
+        anchors=[
+            {"kind": "project", "name": "aa-SDK"},
+            {"kind": "project", "name": "powerfactors-api"},
+        ],
+    )
+    assert stored["id"]
+
+    for project in ("mycelium", "aa-SDK", "powerfactors-api"):
+        rows = await fns["query_memory"](query="anything", project_hint=project)
+        texts = [r["hit"]["text"] for r in rows]
+        assert texts == ["mycelium configure_logging snippet"], (
+            f"missing under project_hint={project!r}: {texts}"
+        )
+
+
+async def test_query_memory_anchor_hint_concept(tools, fake_embed):
+    """Public-library knowledge anchored as a Concept is findable by name."""
+    fns, _ = tools
+    await fns["record"](
+        kind="solution",
+        body="kuzu multi-pair REL TABLE syntax requires 0.11+",
+        anchors=[{"kind": "concept", "name": "kuzu"}],
+    )
+
+    rows = await fns["query_memory"](
+        query="anything",
+        anchor_hint={"kind": "concept", "name": "kuzu"},
+    )
+    assert [r["hit"]["text"] for r in rows] == [
+        "kuzu multi-pair REL TABLE syntax requires 0.11+"
+    ]
+
+
+async def test_query_memory_anchor_hint_mixed_project_and_concept(
+    tools, fake_embed
+):
+    """One memory anchored to a Project AND a Concept surfaces under both."""
+    fns, _ = tools
+    await fns["record"](
+        kind="solution",
+        body="pydantic v2 .model_dump excludes computed fields by default",
+        project_hint="knowitall",
+        anchors=[{"kind": "concept", "name": "pydantic"}],
+    )
+
+    by_project = await fns["query_memory"](
+        query="x", anchor_hint={"kind": "project", "name": "knowitall"}
+    )
+    by_concept = await fns["query_memory"](
+        query="x", anchor_hint={"kind": "concept", "name": "pydantic"}
+    )
+    assert len(by_project) == 1 and len(by_concept) == 1
+    assert by_project[0]["hit"]["id"] == by_concept[0]["hit"]["id"]
+
+
+async def test_query_memory_anchor_hint_unknown_returns_empty(
+    tools, fake_embed
+):
+    fns, _ = tools
+    await fns["record"](
+        kind="note",
+        body="something",
+        anchors=[{"kind": "concept", "name": "real-thing"}],
+    )
+    rows = await fns["query_memory"](
+        query="x", anchor_hint={"kind": "concept", "name": "nonexistent"}
+    )
+    assert rows == []
+
+
+async def test_query_memory_project_hint_still_works(tools, fake_embed):
+    """The legacy project_hint alias must remain functional."""
+    fns, _ = tools
+    await fns["record"](kind="note", body="A", project_hint="legacy-test")
+    await fns["record"](kind="note", body="B", project_hint="other")
+
+    rows = await fns["query_memory"](query="x", project_hint="legacy-test")
+    assert [r["hit"]["text"] for r in rows] == ["A"]
+
+
+async def test_query_memory_rejects_both_hints(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="not both"):
+        await fns["query_memory"](
+            query="x",
+            project_hint="a",
+            anchor_hint={"kind": "project", "name": "b"},
+        )
+
+
+async def test_query_memory_anchor_hint_validates_kind(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="not supported"):
+        await fns["query_memory"](
+            query="x", anchor_hint={"kind": "person", "name": "x"}
+        )
+
+
+async def test_list_memories_anchor_hint_concept(tools, fake_embed):
+    fns, _ = tools
+    await fns["record"](
+        kind="note",
+        body="kuzu tip",
+        anchors=[{"kind": "concept", "name": "kuzu"}],
+    )
+    await fns["record"](kind="note", body="unrelated", project_hint="some-proj")
+
+    rows = await fns["list_memories"](
+        anchor_hint={"kind": "concept", "name": "kuzu"}
+    )
+    assert [r["summary"] for r in rows] == ["kuzu tip"]
+
+
+async def test_list_memories_finds_multi_anchored(tools, fake_embed):
+    fns, _ = tools
+    await fns["record"](
+        kind="note",
+        body="shared recipe",
+        project_hint="primary-proj",
+        anchors=[{"kind": "project", "name": "secondary-proj"}],
+    )
+    rows = await fns["list_memories"](project_hint="secondary-proj")
+    assert [r["summary"] for r in rows] == ["shared recipe"]
+
+
 # ----------------- node_types filter -----------------
 
 

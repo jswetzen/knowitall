@@ -213,6 +213,81 @@ def _lookup_node_label(conn, node_id: str) -> str | None:
     return None
 
 
+# Anchor-hint kinds that query_memory/list_memories accept as a scope. Each
+# value is the graph node label the name resolves against. We keep this small
+# on purpose: Project and Concept are the two anchor types keyed purely by
+# `name`, which is the only stable handle a caller can type. Repo/Symbol/
+# Person have composite keys; if they become useful as scopes, add a separate
+# parameter shape rather than overloading `name`.
+ANCHOR_HINT_KINDS: dict[str, str] = {
+    "project": "Project",
+    "concept": "Concept",
+}
+
+
+def _resolve_anchor_hint_ids(
+    conn, anchor_hint: dict[str, Any] | None
+) -> set[str] | None:
+    """Resolve an anchor_hint to the set of memory ids ANCHORED_TO that node.
+
+    Returns:
+      None — no hint provided, caller should not filter.
+      set() (empty) — hint provided but the anchor node doesn't exist, OR
+        the node exists but has no memories anchored. Caller should treat
+        as "no matches" and short-circuit.
+      {id1, id2, ...} — memory ids to filter by.
+
+    Read-only: does NOT create stub anchor nodes (that's record-time only).
+    """
+    if anchor_hint is None:
+        return None
+    kind = anchor_hint.get("kind")
+    name = anchor_hint.get("name")
+    if not kind or not name:
+        raise ValueError(
+            "anchor_hint requires 'kind' and 'name', got: "
+            f"{anchor_hint!r}"
+        )
+    target_label = ANCHOR_HINT_KINDS.get(kind)
+    if target_label is None:
+        raise ValueError(
+            f"anchor_hint kind '{kind}' not supported. "
+            f"Allowed: {sorted(ANCHOR_HINT_KINDS)}"
+        )
+    # One pass per memory label: collect ids of memory nodes anchored to the
+    # named anchor target. Kuzu rel-table traversal is the source of truth;
+    # the embedding row's denormalized project_id is incidental.
+    ids: set[str] = set()
+    for label in MEMORY_KIND_TO_LABEL.values():
+        result = conn.execute(
+            f"MATCH (n:{label})-[:ANCHORED_TO]->(t:{target_label} "
+            f"{{name: $name}}) RETURN n.id",
+            {"name": name},
+        )
+        while result.has_next():
+            ids.add(str(result.get_next()[0]))
+    return ids
+
+
+def _coerce_legacy_project_hint(
+    project_hint: str | None, anchor_hint: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Resolve the (project_hint, anchor_hint) pair to a single anchor_hint.
+
+    project_hint is the v3 spelling; anchor_hint is the v4 generalization.
+    Passing both is an error — callers must pick one. Passing project_hint
+    alone is auto-rewritten to {"kind":"project","name":project_hint}.
+    """
+    if project_hint is not None and anchor_hint is not None:
+        raise ValueError(
+            "pass either project_hint or anchor_hint, not both. "
+            "project_hint is the deprecated alias."
+        )
+    if project_hint is not None:
+        return {"kind": "project", "name": project_hint}
+    return anchor_hint
+
+
 def _summarize(value: str | None) -> str | None:
     """Title-shape: first SUMMARY_MAX_LEN chars of value (or None)."""
     if value is None:
@@ -246,10 +321,20 @@ def _list_one_label(
     conn,
     label: str,
     *,
-    project_id: str | None,
+    scope_ids: set[str] | None,
     include_retracted: bool,
 ) -> list[dict[str, Any]]:
-    """Return raw rows for one memory label. Sort + slice happen in Python."""
+    """Return raw rows for one memory label. Sort + slice happen in Python.
+
+    scope_ids: if not None, restrict to nodes whose id is in this set. The
+    caller (list_memories) resolves anchor_hint once into a single id set
+    spanning every memory-bearing label. If None, list everything.
+
+    project_id surfaced in the row is informational — it reads any Project
+    anchor on the node via OPTIONAL MATCH. Memories anchored to multiple
+    Projects still appear once (deduped); the graph is the source of truth
+    for the full anchor set.
+    """
     fields = _LIST_FIELDS[label]
     ts_field = fields["created_at_field"]
     body_field = fields["body_field"]
@@ -259,50 +344,37 @@ def _list_one_label(
     clauses: list[str] = []
     if not include_retracted:
         clauses.append("n.retracted_at IS NULL")
+    if scope_ids is not None:
+        if not scope_ids:
+            return []
+        quoted = ", ".join(f"'{i}'" for i in scope_ids)
+        clauses.append(f"n.id IN [{quoted}]")
 
-    # Note has no separate summary column — read body_field twice as a
-    # uniform stand-in (the second slot becomes `stored_summary`, which we
-    # then ignore via `_effective_summary("Note", ...)`).
     summary_select = f"n.{summary_field}" if summary_field else f"n.{body_field}"
-
-    params: dict[str, Any] = {}
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    if project_id is not None:
-        # Filter to a known project; we already know its id, no need to re-project.
-        match_clause = (
-            f"MATCH (n:{label})-[:ANCHORED_TO]->(p:Project {{id: $pid}}){where}"
-        )
-        params["pid"] = project_id
-        return_project_clause = "$pid AS pid"
-    else:
-        # No filter — OPTIONAL MATCH so nodes without a Project anchor still appear.
-        # WHERE must precede OPTIONAL MATCH in Kuzu; placing it after binds to
-        # the optional pattern and silently nulls out p.id when the WHERE clause
-        # is supposed to constrain n only.
-        match_clause = (
-            f"MATCH (n:{label}){where} "
-            f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project)"
-        )
-        return_project_clause = "p.id AS pid"
+    # WHERE must precede OPTIONAL MATCH in Kuzu; placing it after binds to
+    # the optional pattern and silently nulls out p.id when WHERE is meant
+    # to constrain n only.
+    match_clause = (
+        f"MATCH (n:{label}){where} "
+        f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project)"
+    )
 
-    # Alias both columns: Note has body_field == summary_field == "title",
-    # and Kuzu rejects duplicate result column names.
     query = (
         f"{match_clause} "
         f"RETURN n.id, n.{body_field} AS body_value, "
         f"{summary_select} AS stored_summary, n.{ts_field}, "
-        f"n.retracted_at, {return_project_clause}"
+        f"n.retracted_at, p.id AS pid"
     )
-    result = conn.execute(query, params)
+    result = conn.execute(query, {})
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     while result.has_next():
         node_id, body_value, stored_summary, created_at, retracted_at, pid = (
             result.get_next()
         )
-        # OPTIONAL MATCH can yield duplicates if a node has multiple Project
-        # anchors. Dedup keeping first hit — project_id is informational, not
-        # canonical (the graph holds the full set).
+        # OPTIONAL MATCH yields duplicates when a node has multiple Project
+        # anchors. Dedup keeping first hit.
         if node_id in seen_ids:
             continue
         seen_ids.add(node_id)
@@ -460,6 +532,13 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         or code, scratchpad thinking, or speculative ideas the user hasn't
         endorsed.
 
+        For shared/cross-cutting knowledge (internal libraries used in
+        multiple repos, public-library recipes, framework gotchas) MULTI-
+        ANCHOR: pass several `{"kind":"project","name":...}` and/or
+        `{"kind":"concept","name":...}` entries in `anchors`. The same
+        memory then surfaces under each anchor's hint in `query_memory`/
+        `list_memories`. See SCOPING below.
+
         kind taxonomy:
           - "decision" | "task" | "idea" | "note": become first-class graph
             nodes (citable, expandable, can be the target of edges).
@@ -502,6 +581,34 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
           {"kind": "person",  "email": "claude@swetzen.com"}
         Existing nodes are reused by natural key (sha / (repo,path) / email /
         name). Sparse anchors are accepted — backfill is a client concern.
+
+        SCOPING — anchor to make memory findable later:
+
+          Internal library used across repos (e.g. an in-house mycelium
+          package consumed by aa-SDK and powerfactors-api):
+            anchors=[
+              {"kind":"project", "name":"mycelium"},
+              {"kind":"project", "name":"aa-SDK"},
+              {"kind":"project", "name":"powerfactors-api"},
+            ]
+          Future `query_memory(anchor_hint={"kind":"project","name":X})`
+          finds the entry under any of those names.
+
+          Public library / framework knowledge (e.g. a kuzu pitfall, a
+          pydantic recipe, a stackoverflow-shaped fix you don't want to
+          re-derive): tag with a concept anchor named after the library
+          or topic, plus optionally the consumer projects where you hit
+          it.
+            anchors=[
+              {"kind":"concept", "name":"kuzu"},
+              {"kind":"project", "name":"knowitall"},
+            ]
+          Future `query_memory(anchor_hint={"kind":"concept","name":
+          "kuzu"})` finds it regardless of which repo you're in next.
+
+          Multi-anchoring is the idiom for shared knowledge. There is no
+          "primary" project; the graph is the source of truth and the
+          memory surfaces under every anchor's hint.
 
         summary: optional ≤200-char title-shaped string surfaced by
         `list_memories` and `get_memory`. If omitted, those tools fall
@@ -863,6 +970,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
     async def query_memory(
         query: str,
         project_hint: str | None = None,
+        anchor_hint: dict[str, Any] | None = None,
         k: int = 10,
         expand_hops: int = 0,
         include_retracted: bool = False,
@@ -890,10 +998,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             string as the query — exact tokens beat paraphrases.
           - The user asks to "get X working" / "set up X" / "run X
             locally" for an existing project. Before starting, run
-            `list_memories(project_hint=X, kind="episode")` once to
-            surface known gotchas without needing the right query.
+            `list_memories(anchor_hint={"kind":"project","name":X},
+            kind="episode")` once to surface known gotchas without
+            needing the right query.
           - You're about to recommend a non-obvious workaround. Check
             whether a solution memory already covers it.
+          - You hit a question you'd otherwise paste into a search engine
+            (a library quirk, a framework gotcha, a "why doesn't X work"
+            question). Try anchor_hint with kind="concept" first — the
+            library/topic name is often the right scope, e.g.
+            anchor_hint={"kind":"concept","name":"kuzu"}.
 
         Hygiene: if a hit names a specific file, function, or flag,
         VERIFY it still exists (grep, read) before recommending. Memory
@@ -906,8 +1020,19 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         Args:
           query: free-text. Embedded; ranked by vector distance.
-          project_hint: project NAME (not id). Restricts to that project's
-            embedding rows. If the project name doesn't exist, returns [].
+          anchor_hint: scope the search to memory anchored to a specific
+            graph node. Shapes:
+              {"kind":"project", "name":"knowitall"}
+                — our internal projects.
+              {"kind":"concept", "name":"kuzu"}
+                — public libraries, frameworks, or cross-cutting topics.
+            Resolves via the ANCHORED_TO graph, so a memory anchored to
+            multiple projects/concepts surfaces under each of them — this
+            is the idiom for shared/library knowledge (see `record`).
+            If the named node doesn't exist, returns [].
+          project_hint: DEPRECATED alias for
+            anchor_hint={"kind":"project","name":<hint>}. Kept for
+            backwards compatibility. Passing both raises ValueError.
           k: top-k hits to return (default 10).
           expand_hops: 0 (default) skips neighbor expansion entirely; 1
             includes outbound ANCHORED_TO targets. Values >1 are rejected
@@ -933,12 +1058,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         vec = await embed(state.http, query)
         conn = state.kuzu_conn()
 
+        effective_hint = _coerce_legacy_project_hint(project_hint, anchor_hint)
+
         clauses: list[str] = []
-        if project_hint:
-            project_id = resolve_project(conn, project_hint)
-            if project_id is None:
+        if effective_hint is not None:
+            scoped_ids = _resolve_anchor_hint_ids(conn, effective_hint)
+            if not scoped_ids:
+                # Unknown anchor target, or anchor exists with zero memories.
                 return []
-            clauses.append(f"project_id = '{project_id}'")
+            quoted = ", ".join(f"'{i}'" for i in scoped_ids)
+            clauses.append(f"id IN ({quoted})")
         if not include_retracted:
             clauses.append("retracted_at IS NULL")
         if node_types:
@@ -1046,6 +1175,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
     async def list_memories(
         kind: str | None = None,
         project_hint: str | None = None,
+        anchor_hint: dict[str, Any] | None = None,
         limit: int = 50,
         offset: int = 0,
         order_by: str = "created_at_desc",
@@ -1067,8 +1197,17 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             for all). Episode-flavored kinds (summary/blocker/fact) all
             live under "episode" here — use `query_memory` with node_types
             for sub-kind discrimination.
-          project_hint: project NAME (not id). Filters via ANCHORED_TO
-            Project edge. If the project name doesn't exist, returns [].
+          anchor_hint: scope to memory anchored to a specific graph node.
+            Shapes:
+              {"kind":"project", "name":"knowitall"}  — internal projects
+              {"kind":"concept", "name":"kuzu"}       — public libraries,
+                frameworks, or cross-cutting topics
+            Resolves via the ANCHORED_TO graph, so a memory anchored to
+            multiple projects/concepts surfaces under each. If the named
+            node doesn't exist, returns [].
+          project_hint: DEPRECATED alias for
+            anchor_hint={"kind":"project","name":<hint>}. Passing both
+            raises ValueError.
           limit: max rows returned (default 50). Applied after sort.
           offset: rows to skip (default 0). For paging.
           order_by: "created_at_desc" (default) | "created_at_asc".
@@ -1089,16 +1228,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         conn = state.kuzu_conn()
 
-        if project_hint is not None:
-            result = conn.execute(
-                "MATCH (p:Project {name: $n}) RETURN p.id LIMIT 1",
-                {"n": project_hint},
+        effective_hint = _coerce_legacy_project_hint(project_hint, anchor_hint)
+        if effective_hint is not None:
+            scope_ids: set[str] | None = _resolve_anchor_hint_ids(
+                conn, effective_hint
             )
-            if not result.has_next():
+            # Empty set = anchor node missing OR has zero memories. Both → [].
+            if not scope_ids:
                 return []
-            project_id: str | None = str(result.get_next()[0])
         else:
-            project_id = None
+            scope_ids = None
 
         labels = (
             [MEMORY_KIND_TO_LABEL[kind]] if kind is not None else
@@ -1111,7 +1250,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 _list_one_label(
                     conn,
                     label,
-                    project_id=project_id,
+                    scope_ids=scope_ids,
                     include_retracted=include_retracted,
                 )
             )
