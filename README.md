@@ -51,6 +51,18 @@ over your LAN/VPN with a bearer token.
 | `forget(id, reason)` | Soft undo — sets `retracted_at`; default queries hide it. |
 | `cypher(query, params)` | Read-only Cypher passthrough over the graph. |
 
+#### Calendar (Cango) shims
+
+Thin shims over the sibling `cango-daemon` (Unix socket at `KNOWITALL_CANGO_SOCKET`, default `/run/cango/cango.sock`). No calendar logic lives in knowitall; these marshal JSON-RPC and pass the daemon's answer through. If the daemon is down or the socket is missing, each returns `{"error": "cango_unavailable", "reason": ...}` — memory tools are unaffected.
+
+| Tool | Purpose |
+|---|---|
+| `check_availability(start, end, people)` | "Can we go?" → `free` / `soft_conflict` / `hard_conflict` verdict + conflicts for a window across family calendars. |
+| `find_free_slot(duration_minutes, between_start, between_end, people, working_hours)` | Candidate free windows of a given length within a range. |
+| `list_events(start, end, people)` | Events in a window with their resolved roles and `resolved_by` trace reason. |
+| `explain_event(event_id)` | Layer-by-layer trace of how one event's role was resolved. |
+| `list_series(source_id)` | Recent recurring series on a source — input for adding attendance edges. |
+
 ### MCP prompts
 
 Surfaced to Claude Code as `/knowitall:*`:
@@ -138,6 +150,7 @@ ingest/         Structural extractors — git today, tree-sitter later.
                 its commit/file/person upserts back the lazy anchor stubs.
 client/cli.py   Tiny CLI MCP client for smoke testing
 server/anchors.py     Anchor resolution + lazy stub creation + ANCHORED_TO writes
+server/cango.py       Calendar (Cango) shims — JSON-RPC over the daemon's Unix socket
 server/mcp_prompts.py /knowitall:* prompts (status, capture, provenance, reflect)
 tests/          Unit + e2e
 deploy/         Dockerfile + docker-compose.yml

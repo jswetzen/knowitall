@@ -8,6 +8,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from server.auth import BearerTokenMiddleware
 from server import config
+from server.cango import register_cango_tools
 from server.deps import build_state
 from server.mcp_prompts import register_prompts
 from server.mcp_tools import register_tools
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     register_tools(mcp, state)
+    register_cango_tools(mcp)
     register_prompts(mcp, state)
 
     @asynccontextmanager

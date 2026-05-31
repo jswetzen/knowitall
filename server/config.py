@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8765
     embedding_dim: int = 768
+    # Unix socket of the sibling cango-daemon. Shared volume in the deployed
+    # podman-compose; the calendar shims in server/cango.py dial it.
+    cango_socket: str = "/run/cango/cango.sock"
 
 
 settings = Settings()
