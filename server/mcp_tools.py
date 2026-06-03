@@ -735,9 +735,12 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             raise ValueError(f"Task {id} is retracted")
 
         closed_at_clause = ", t.closed_at = $now" if status == "done" else ""
+        params = {"id": id, "s": status}
+        if closed_at_clause:
+            params["now"] = now
         conn.execute(
             f"MATCH (t:Task {{id: $id}}) SET t.status = $s{closed_at_clause}",
-            {"id": id, "s": status, "now": now},
+            params,
         )
 
         anchored = apply_anchors(conn, "Task", id, anchors or [], now)

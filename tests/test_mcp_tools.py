@@ -355,6 +355,21 @@ async def test_update_todo_transitions_status(tools, fake_embed):
     assert rows[0][0] == "done"
 
 
+async def test_update_todo_non_done_status(tools, fake_embed):
+    # Regression: non-"done" transitions must not pass an unused $now param,
+    # which Kuzu rejects with "Parameter now not found."
+    fns, _ = tools
+    stored = await fns["record"](kind="task", body="ship thing")
+    out = await fns["update_todo"](id=stored["id"], status="in_progress")
+    assert out["status"] == "in_progress"
+
+    rows = await fns["cypher"](
+        "MATCH (t:Task {id: $id}) RETURN t.status, t.closed_at", {"id": stored["id"]}
+    )
+    assert rows[0][0] == "in_progress"
+    assert rows[0][1] is None
+
+
 async def test_update_todo_with_commit_creates_closed_by(tools, fake_embed):
     fns, _ = tools
     stored = await fns["record"](kind="task", body="fix bug")
