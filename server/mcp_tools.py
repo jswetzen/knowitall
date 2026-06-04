@@ -651,58 +651,64 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         label = KIND_TO_LABEL[kind]
         node_type = NODE_TYPE_BY_KIND[kind]
 
-        vec = await embed(state.http, body)
-        if len(vec) != config.settings.embedding_dim:
-            raise RuntimeError(
-                f"embedding dim mismatch: got {len(vec)}, "
-                f"configured {config.settings.embedding_dim}"
-            )
+        with profile("record") as p:
+            with p.stage("embed"):
+                vec = await embed(state.http, body)
+            if len(vec) != config.settings.embedding_dim:
+                raise RuntimeError(
+                    f"embedding dim mismatch: got {len(vec)}, "
+                    f"configured {config.settings.embedding_dim}"
+                )
 
-        conn = state.kuzu_conn()
-        now = _now()
-        project_id = resolve_project(conn, project_hint)
-        node_id = str(uuid.uuid4())
+            conn = state.kuzu_conn()
+            now = _now()
+            with p.stage("kuzu"):
+                project_id = resolve_project(conn, project_hint)
+                node_id = str(uuid.uuid4())
 
-        _create_graph_node(
-            conn,
-            label=label,
-            node_id=node_id,
-            body=body,
-            kind=kind,
-            created_at=now,
-            summary=summary,
-        )
+                _create_graph_node(
+                    conn,
+                    label=label,
+                    node_id=node_id,
+                    body=body,
+                    kind=kind,
+                    created_at=now,
+                    summary=summary,
+                )
 
-        # Project anchor: prepend so project shows up in ANCHORED_TO graph too.
-        anchor_list: list[dict[str, Any]] = []
-        if project_hint:
-            anchor_list.append({"kind": "project", "name": project_hint})
-        if anchors:
-            anchor_list.extend(anchors)
-        anchored = apply_anchors(conn, label, node_id, anchor_list, now)
+                # Project anchor: prepend so project shows up in ANCHORED_TO graph.
+                anchor_list: list[dict[str, Any]] = []
+                if project_hint:
+                    anchor_list.append({"kind": "project", "name": project_hint})
+                if anchors:
+                    anchor_list.extend(anchors)
+                anchored = apply_anchors(conn, label, node_id, anchor_list, now)
 
-        related: list[dict[str, str]] = []
-        if relates_to:
-            related = _apply_relates_to(conn, label, node_id, relates_to, now)
+                related: list[dict[str, str]] = []
+                if relates_to:
+                    related = _apply_relates_to(
+                        conn, label, node_id, relates_to, now
+                    )
 
-        _insert_embedding_row(
-            state,
-            row_id=node_id,
-            node_type=node_type,
-            text=body,
-            vec=vec,
-            project_id=project_id,
-            kind=kind,
-            created_at=now,
-        )
+            with p.stage("lance"):
+                _insert_embedding_row(
+                    state,
+                    row_id=node_id,
+                    node_type=node_type,
+                    text=body,
+                    vec=vec,
+                    project_id=project_id,
+                    kind=kind,
+                    created_at=now,
+                )
 
-        return {
-            "id": node_id,
-            "node_type": node_type,
-            "project_id": project_id,
-            "anchored": anchored,
-            "related": related,
-        }
+            return {
+                "id": node_id,
+                "node_type": node_type,
+                "project_id": project_id,
+                "anchored": anchored,
+                "related": related,
+            }
 
     @mcp.tool()
     async def update_todo(
