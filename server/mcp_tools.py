@@ -16,6 +16,7 @@ from server.anchors import (
     resolve_project,
 )
 from server.deps import AppState, embed
+from server.profiling import profile
 
 MUTATING_PATTERN = re.compile(
     r"\b(CREATE|MERGE|DELETE|SET|DROP|REMOVE|DETACH|COPY|ALTER|INSTALL|LOAD|ATTACH|CALL)\b",
@@ -1068,7 +1069,26 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 f"expand_hops must be 0 or 1, got {expand_hops}. "
                 "Multi-hop traversal is not implemented; use cypher for it."
             )
-        vec = await embed(state.http, query)
+        with profile("query_memory") as p:
+            with p.stage("embed"):
+                vec = await embed(state.http, query)
+            return _query_memory_search(
+                state, p, vec, k, expand_hops, snippet_chars,
+                project_hint, anchor_hint, node_types, include_retracted,
+            )
+
+    def _query_memory_search(
+        state: AppState,
+        p: Any,
+        vec: list[float],
+        k: int,
+        expand_hops: int,
+        snippet_chars: int,
+        project_hint: str | None,
+        anchor_hint: dict[str, Any] | None,
+        node_types: list[str] | None,
+        include_retracted: bool,
+    ) -> list[dict[str, Any]]:
         conn = state.kuzu_conn()
 
         effective_hint = _coerce_legacy_project_hint(project_hint, anchor_hint)
@@ -1087,10 +1107,12 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             quoted = ", ".join(f"'{nt}'" for nt in node_types)
             clauses.append(f"node_type IN ({quoted})")
 
-        search = state.embeddings.search(vec).limit(k)
-        if clauses:
-            search = search.where(" AND ".join(clauses), prefilter=True)
-        table = search.to_arrow()
+        with p.stage("lance"):
+            search = state.embeddings.search(vec).limit(k)
+            if clauses:
+                search = search.where(" AND ".join(clauses), prefilter=True)
+            table = search.to_arrow()
+        p.count(rows=table.num_rows)
 
         rows: list[dict[str, Any]] = []
         for record_row in table.to_pylist():
@@ -1122,11 +1144,13 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 ),
                 "score": float(record_row["_distance"]),
             }
-            neighbors = (
-                _expand_neighbors(conn, label, node_id, expand_hops)
-                if expand_hops > 0
-                else []
-            )
+            if expand_hops > 0:
+                with p.stage("kuzu"):
+                    neighbors = _expand_neighbors(
+                        conn, label, node_id, expand_hops
+                    )
+            else:
+                neighbors = []
             rows.append({"hit": hit, "neighbors": neighbors})
         return rows
 
@@ -1177,12 +1201,15 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 "Mutating Cypher rejected. Allowed: read-only "
                 "MATCH/RETURN/WHERE/WITH/ORDER/LIMIT."
             )
-        conn = state.kuzu_conn()
-        result = conn.execute(query, params or {})
-        rows: list[list[Any]] = []
-        while result.has_next():
-            rows.append([_coerce(v) for v in result.get_next()])
-        return rows
+        with profile("cypher") as p:
+            conn = state.kuzu_conn()
+            with p.stage("kuzu"):
+                result = conn.execute(query, params or {})
+                rows: list[list[Any]] = []
+                while result.has_next():
+                    rows.append([_coerce(v) for v in result.get_next()])
+            p.count(rows=len(rows))
+            return rows
 
     @mcp.tool()
     async def list_memories(
@@ -1257,23 +1284,32 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             [MEMORY_KIND_TO_LABEL[k] for k in MEMORY_KINDS]
         )
 
-        all_rows: list[dict[str, Any]] = []
-        for label in labels:
-            all_rows.extend(
-                _list_one_label(
-                    conn,
-                    label,
-                    scope_ids=scope_ids,
-                    include_retracted=include_retracted,
-                )
-            )
+        with profile("list_memories") as p:
+            all_rows: list[dict[str, Any]] = []
+            with p.stage("kuzu"):
+                for label in labels:
+                    all_rows.extend(
+                        _list_one_label(
+                            conn,
+                            label,
+                            scope_ids=scope_ids,
+                            include_retracted=include_retracted,
+                        )
+                    )
 
-        # Sort, then page. Rows with NULL created_at sort to the end either way.
-        reverse = order_by == "created_at_desc"
-        all_rows.sort(
-            key=lambda r: (r["created_at"] is None, r["created_at"] or datetime.min),
-            reverse=reverse,
-        )
+            # Sort, then page. NULL created_at sorts to the end either way.
+            with p.stage("sort"):
+                reverse = order_by == "created_at_desc"
+                all_rows.sort(
+                    key=lambda r: (
+                        r["created_at"] is None,
+                        r["created_at"] or datetime.min,
+                    ),
+                    reverse=reverse,
+                )
+            # scanned = total rows pulled before paging; the gap between this
+            # and `limit` is the wasted work (no LIMIT pushed into Cypher).
+            p.count(scanned=len(all_rows), labels=len(labels))
         sliced = all_rows[offset : offset + limit]
 
         for row in sliced:
