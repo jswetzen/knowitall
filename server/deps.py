@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -45,19 +45,53 @@ class AppState:
     # maintenance every config.maint_interval rows so the index/fragments
     # don't drift between restarts.
     inserts_since_optimize: int = 0
+    # Held reference to the in-flight background optimize task. Both prevents
+    # GC of a bare create_task and acts as the "already running" guard so we
+    # never stack concurrent optimize() passes on the same table.
+    _optimize_task: "asyncio.Task[None] | None" = field(
+        default=None, repr=False
+    )
 
     def kuzu_conn(self) -> kuzu.Connection:
         return kuzu.Connection(self.kuzu_db)
 
     def note_insert_and_maybe_optimize(self) -> None:
-        """Call after each embedding insert. Optimizes every Nth row."""
-        self.inserts_since_optimize += 1
+        """Call after each embedding insert. Every Nth row, kick off a
+        background optimize so record() can return without waiting on it.
+
+        optimize() is blocking LanceDB I/O, so it runs via asyncio.to_thread
+        on a worker thread rather than on the event loop. If a previous pass
+        is still running we skip (and don't reset the counter), so the work
+        coalesces instead of piling up under a burst of writes.
+        """
         interval = config.settings.maint_interval
-        if interval > 0 and self.inserts_since_optimize >= interval:
-            self.inserts_since_optimize = 0
-            optimize_embeddings(self.embeddings)
+        if interval <= 0:
+            return
+        self.inserts_since_optimize += 1
+        if self.inserts_since_optimize < interval:
+            return
+        if self._optimize_task is not None and not self._optimize_task.done():
+            # Previous optimize still running; let it finish, try again next
+            # insert. Counter stays at/above interval so we retry promptly.
+            return
+        self.inserts_since_optimize = 0
+        self._optimize_task = asyncio.create_task(self._run_optimize())
+
+    async def _run_optimize(self) -> None:
+        try:
+            await asyncio.to_thread(optimize_embeddings, self.embeddings)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"knowitall.maint background optimize failed: {exc}",
+                  file=sys.stderr, flush=True)
 
     async def aclose(self) -> None:
+        # Let an in-flight optimize finish so we don't tear down its thread
+        # mid-write; it's bounded and idempotent so the wait is short.
+        if self._optimize_task is not None and not self._optimize_task.done():
+            try:
+                await self._optimize_task
+            except Exception:  # pragma: no cover - already logged in _run_optimize
+                pass
         await self.http.aclose()
 
 

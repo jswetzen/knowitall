@@ -701,9 +701,11 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                     kind=kind,
                     created_at=now,
                 )
-                # Periodic compaction/reindex (every maint_interval inserts).
-                # Folded into the lance stage so its cost shows in profiling.
-                state.note_insert_and_maybe_optimize()
+
+            # Every maint_interval inserts this kicks off compaction/reindex on
+            # a background thread and returns immediately, so the optimize cost
+            # is NOT in this call's profile line.
+            state.note_insert_and_maybe_optimize()
 
             return {
                 "id": node_id,
