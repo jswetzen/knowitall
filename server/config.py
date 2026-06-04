@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # per call (stage breakdown: embed / lance / kuzu + total + row counts).
     # Off by default; flip with KNOWITALL_PROFILE=1 to find the bottleneck.
     profile: bool = False
+    # Re-run Lance compaction + reindex after this many inserts. 0 disables the
+    # periodic pass (startup maintenance still runs). 50 keeps fragment count
+    # and index staleness bounded without optimizing on every write.
+    maint_interval: int = 50
     # Unix socket of the sibling cango-daemon. Shared volume in the deployed
     # podman-compose; the calendar shims in server/cango.py dial it.
     cango_socket: str = "/run/cango/cango.sock"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +13,10 @@ import pyarrow as pa
 
 from schema.migrate import apply_migrations
 from server import config
+
+# An IVF index needs enough rows to train meaningful partitions; below this we
+# leave the table index-free (a flat scan over a few hundred vectors is fast).
+_MIN_ROWS_FOR_INDEX = 256
 
 
 def _embeddings_schema(dim: int) -> pa.Schema:
@@ -35,9 +41,21 @@ class AppState:
     lance_db: "lancedb.DBConnection"
     embeddings: "lancedb.table.Table"
     http: httpx.AsyncClient
+    # Inserts since the last optimize pass. record() bumps this and triggers
+    # maintenance every config.maint_interval rows so the index/fragments
+    # don't drift between restarts.
+    inserts_since_optimize: int = 0
 
     def kuzu_conn(self) -> kuzu.Connection:
         return kuzu.Connection(self.kuzu_db)
+
+    def note_insert_and_maybe_optimize(self) -> None:
+        """Call after each embedding insert. Optimizes every Nth row."""
+        self.inserts_since_optimize += 1
+        interval = config.settings.maint_interval
+        if interval > 0 and self.inserts_since_optimize >= interval:
+            self.inserts_since_optimize = 0
+            optimize_embeddings(self.embeddings)
 
     async def aclose(self) -> None:
         await self.http.aclose()
@@ -65,10 +83,74 @@ def build_state() -> AppState:
             exist_ok=True,
         )
 
+    # Startup maintenance: compact fragments + (re)index. Once per deploy;
+    # self-heals a table that fragmented or grew since the last boot.
+    optimize_embeddings(embeddings)
+
     http = httpx.AsyncClient(base_url=s.ollama_url, timeout=5.0)
     return AppState(
         kuzu_db=kuzu_db, lance_db=lance_db, embeddings=embeddings, http=http
     )
+
+
+def _has_vector_index(table: "lancedb.table.Table") -> bool:
+    try:
+        return any("vector" in idx.columns for idx in table.list_indices())
+    except Exception:
+        return False
+
+
+def optimize_embeddings(table: "lancedb.table.Table") -> None:
+    """Compact fragments and (re)build the IVF_PQ vector index.
+
+    Two problems this fixes, both observed via KNOWITALL_PROFILE:
+      - record() appends one row per call, so the table accrues many tiny
+        fragments; `optimize()` compacts them, which is what keeps both
+        writes and scans fast.
+      - query_memory() with no ANN index does a brute-force flat scan
+        (~300ms for 8 hits). An IVF_PQ index turns that into a partition
+        probe.
+
+    Safe to call repeatedly. No-op below _MIN_ROWS_FOR_INDEX rows, where a
+    flat scan is already fast and IVF training would be ill-conditioned.
+    """
+    try:
+        rows = table.count_rows()
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"knowitall.maint optimize skipped: count failed: {exc}",
+              file=sys.stderr, flush=True)
+        return
+    if rows < _MIN_ROWS_FOR_INDEX:
+        return
+
+    # Compact fragments + merge any pending index deltas. Cheap relative to a
+    # full reindex and the main lever for write/scan latency.
+    try:
+        table.optimize()
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"knowitall.maint optimize() failed: {exc}",
+              file=sys.stderr, flush=True)
+
+    # Size partitions to ~sqrt(rows): the IVF rule of thumb. num_sub_vectors
+    # must divide the embedding dim (768 / 96 = 8). replace=True rebuilds in
+    # place so growth is reflected on each maintenance pass.
+    num_partitions = max(1, min(256, int(math.sqrt(rows))))
+    try:
+        table.create_index(
+            metric="l2",
+            num_partitions=num_partitions,
+            num_sub_vectors=96,
+            index_type="IVF_PQ",
+            replace=True,
+        )
+        print(
+            f"knowitall.maint indexed rows={rows} "
+            f"num_partitions={num_partitions}",
+            file=sys.stderr, flush=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"knowitall.maint create_index failed: {exc}",
+              file=sys.stderr, flush=True)
 
 
 async def embed(http: httpx.AsyncClient, text: str) -> list[float]:
