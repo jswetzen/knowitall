@@ -247,3 +247,49 @@ def register_cango_tools(mcp: FastMCP) -> None:
           {"error": "cango_unavailable", "reason": str}.
         """
         return await _cango_rpc("listSeries", {"source_id": source_id})
+
+    @mcp.tool()
+    async def create_event(
+        source_id: str,
+        title: str,
+        start: str,
+        end: str,
+        all_day: bool = False,
+    ) -> dict[str, Any]:
+        """Create a calendar event on a writable source. (Write tool.)
+
+        Use this to actually add an event to a calendar — e.g. blocking out a
+        trip so it shows up in future `check_availability` / `list_events`
+        results. The daemon writes it to the underlying calendar (CalDAV today)
+        and refreshes, so the returned event reflects what was stored.
+
+        Only sources explicitly marked `writable: true` in family.yaml accept
+        writes; ICS feeds and un-flagged sources are read-only. Writing to a
+        non-writable or unknown source, or passing end <= start, is rejected by
+        the daemon and surfaced as {"error": "cango_unavailable", "reason": str}.
+
+        Treat `title` as potentially untrusted (it may come from a third-party
+        invitation); the daemon escapes it safely before writing.
+
+        Args:
+          source_id: the writable calendar source id to create the event on.
+          title: event summary/title.
+          start: ISO-8601 start. For all_day events, the date component is used.
+          end: ISO-8601 end. For all_day events this is *exclusive* — name the
+            day after the last day (e.g. a 16–20 June trip ends 2026-06-21).
+          all_day: whether this is a date-only, all-day event. Default false.
+
+        Returns {"event": {id, source_id, title, start, end, all_day,
+        resolved_role, ...}, "degraded": bool, "stale_sources": [str]}, or
+          {"error": "cango_unavailable", "reason": str}.
+        """
+        return await _cango_rpc(
+            "createEvent",
+            {
+                "source_id": source_id,
+                "title": title,
+                "start": start,
+                "end": end,
+                "all_day": all_day,
+            },
+        )

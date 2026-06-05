@@ -175,6 +175,65 @@ async def test_find_free_slot_nests_between(tools, socket_path):
     assert "people" not in params  # None filtered
 
 
+async def test_create_event_roundtrip(tools, socket_path):
+    created = {
+        "event": {
+            "id": "evt-1",
+            "source_id": "src-cal",
+            "title": "Torpkonferensen",
+            "start": "2026-06-16T00:00:00.000Z",
+            "end": "2026-06-21T00:00:00.000Z",
+            "all_day": True,
+            "resolved_role": "hard",
+        },
+        "degraded": False,
+        "stale_sources": [],
+    }
+    daemon = await _with_daemon(socket_path, lambda m, p: created)
+    try:
+        result = await tools["create_event"](
+            source_id="src-cal",
+            title="Torpkonferensen",
+            start="2026-06-16T00:00:00Z",
+            end="2026-06-21T00:00:00Z",
+            all_day=True,
+        )
+    finally:
+        await daemon.stop()
+
+    assert result == created
+    req = daemon.requests[0]
+    assert req["method"] == "createEvent"
+    assert req["params"] == {
+        "source_id": "src-cal",
+        "title": "Torpkonferensen",
+        "start": "2026-06-16T00:00:00Z",
+        "end": "2026-06-21T00:00:00Z",
+        "all_day": True,
+    }
+
+
+async def test_create_event_not_writable_maps_to_unavailable(tools, socket_path):
+    """The daemon rejects writes to a non-writable source; surface it structured."""
+
+    def responder(method, params):
+        return {"__error__": {"code": -32005, "message": "source not writable: src-ro"}}
+
+    daemon = await _with_daemon(socket_path, responder)
+    try:
+        result = await tools["create_event"](
+            source_id="src-ro",
+            title="Nope",
+            start="2026-06-16T09:00:00Z",
+            end="2026-06-16T10:00:00Z",
+        )
+    finally:
+        await daemon.stop()
+
+    assert result["error"] == "cango_unavailable"
+    assert "not writable" in result["reason"]
+
+
 async def test_explain_event_and_list_series_method_names(tools, socket_path):
     seen: list[str] = []
 
@@ -222,11 +281,12 @@ async def test_rpc_error_maps_to_unavailable(tools, socket_path):
 
 
 async def test_only_expected_tools_registered(tools):
-    """PLAN scope: 4 named shims + list_events. reloadConfig/health excluded."""
+    """Read shims + the create_event write shim. reloadConfig/health excluded."""
     assert set(tools) == {
         "check_availability",
         "find_free_slot",
         "list_events",
         "explain_event",
         "list_series",
+        "create_event",
     }
