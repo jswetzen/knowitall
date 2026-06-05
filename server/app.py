@@ -29,7 +29,11 @@ def create_app() -> FastAPI:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     register_tools(mcp, state)
-    register_cango_tools(mcp)
+    # Calendar shims are opt-in: only the personal deployment runs the sibling
+    # cango-daemon. Skip registration entirely elsewhere (e.g. work) so the
+    # tools don't even appear on the surface.
+    if config.settings.cango:
+        register_cango_tools(mcp)
     register_prompts(mcp, state)
 
     @asynccontextmanager

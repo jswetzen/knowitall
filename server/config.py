@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # Unix socket of the sibling cango-daemon. Shared volume in the deployed
     # podman-compose; the calendar shims in server/cango.py dial it.
     cango_socket: str = "/run/cango/cango.sock"
+    # Opt-in: only register the cango calendar shims when explicitly enabled.
+    # The personal deployment runs alongside cango-daemon and wants them; a work
+    # deployment has no daemon and shouldn't surface calendar tools at all. Off
+    # by default; flip with KNOWITALL_CANGO=1.
+    cango: bool = False
 
 
 settings = Settings()
