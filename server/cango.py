@@ -188,26 +188,52 @@ def register_cango_tools(mcp: FastMCP) -> None:
         start: str,
         end: str,
         people: list[str] | None = None,
+        extended: bool = False,
+        exclude_roles: list[str] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> dict[str, Any]:
         """List calendar events in a window with their resolved roles.
 
         Use this to see *what's actually on the calendar* for a window — each
-        event carries its resolved role (hard/soft/info/conditional) and why it
-        resolved that way (`resolved_by`). Good for explaining a verdict or
-        eyeballing a day.
+        event carries its resolved role (hard/soft/info/conditional). Good for
+        explaining a verdict or eyeballing a day.
+
+        Output is **compact by default** (a full-month window is one call): the
+        large Exchange GUIDs (`id`, `series_id`) are omitted, and
+        `resolved_by`/`resolved_reason` are dropped for plain source-default
+        verdicts (kept whenever a rule/attendance/structural decision applied).
+        A `day_span` field appears on multi-day events (e.g. 3 for a Fri→Sun
+        event) so spans don't hide behind a single start date.
 
         Args:
           start: ISO-8601 window start.
           end: ISO-8601 window end.
           people: optional list of person ids to restrict to. Omit for all.
+          extended: when True, include `id` and `series_id` and always include
+            `resolved_by`/`resolved_reason`. Needed to get an event id for
+            follow-up calls like `explain_event`.
+          exclude_roles: optional roles to drop (e.g. ["soft"]). Default keeps
+            everything so a soft-only event is never silently hidden.
+          limit: max events returned (daemon default 1000 — high enough that a
+            month is a single fetch). offset: events to skip, for paging.
 
-        Returns {"events": [ {id, source_id, person_id, series_id, title,
-        start, end, all_day, resolved_role, resolved_by, resolved_reason, ...}
-        ], "degraded": bool, "stale_sources": [str]}, or
-          {"error": "cango_unavailable", "reason": str}.
+        Returns {"events": [ {source_id, person_id, title, start, end, all_day,
+        resolved_role, day_span?, ... (id/series_id only when extended)} ],
+        "total": int, "returned": int, "truncated": bool, "degraded": bool,
+        "stale_sources": [str]}, or {"error": "cango_unavailable", "reason": str}.
         """
         return await _cango_rpc(
-            "listEvents", {"start": start, "end": end, "people": people}
+            "listEvents",
+            {
+                "start": start,
+                "end": end,
+                "people": people,
+                "extended": extended,
+                "exclude_roles": exclude_roles,
+                "limit": limit,
+                "offset": offset,
+            },
         )
 
     @mcp.tool()

@@ -252,6 +252,53 @@ async def test_explain_event_and_list_series_method_names(tools, socket_path):
     assert seen == ["explainEvent", "listSeries", "listEvents"]
 
 
+async def test_list_events_forwards_compact_params(tools, socket_path):
+    """Default call is compact (extended=False); unset optionals are filtered."""
+    daemon = await _with_daemon(socket_path, lambda m, p: {"events": []})
+    try:
+        await tools["list_events"](
+            start="2026-06-01T00:00:00Z", end="2026-06-02T00:00:00Z"
+        )
+    finally:
+        await daemon.stop()
+
+    params = daemon.requests[0]["params"]
+    assert params == {
+        "start": "2026-06-01T00:00:00Z",
+        "end": "2026-06-02T00:00:00Z",
+        "extended": False,
+    }
+    # None-valued optionals never reach the daemon's schema.
+    for k in ("people", "exclude_roles", "limit", "offset"):
+        assert k not in params
+
+
+async def test_list_events_forwards_all_params(tools, socket_path):
+    daemon = await _with_daemon(socket_path, lambda m, p: {"events": []})
+    try:
+        await tools["list_events"](
+            start="2026-06-01T00:00:00Z",
+            end="2026-07-01T00:00:00Z",
+            people=["johan"],
+            extended=True,
+            exclude_roles=["soft"],
+            limit=50,
+            offset=10,
+        )
+    finally:
+        await daemon.stop()
+
+    assert daemon.requests[0]["params"] == {
+        "start": "2026-06-01T00:00:00Z",
+        "end": "2026-07-01T00:00:00Z",
+        "people": ["johan"],
+        "extended": True,
+        "exclude_roles": ["soft"],
+        "limit": 50,
+        "offset": 10,
+    }
+
+
 # ----------------- failure modes -----------------
 
 
