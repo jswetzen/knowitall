@@ -7,3 +7,6 @@ data/
 .pytest_cache/
 .ruff_cache/
 uv.lock
+
+# Local Claude Code state — never commit to the shared repo
+.claude/
