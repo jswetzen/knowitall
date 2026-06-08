@@ -241,9 +241,9 @@ def register_cango_tools(mcp: FastMCP) -> None:
         """Explain how a single event's role was resolved, layer by layer.
 
         Use this to answer "why is this counted as a hard conflict?" — the
-        trace shows each resolution layer (structural / attendance / rule /
-        source-default) and its outcome, so the user can see whether to add a
-        rule or an attendance edge to change the verdict.
+        trace shows each resolution layer (structural / rule / source-default /
+        mask) and its outcome, so the user can see whether to add or amend a
+        rule (via `record_rule` / `amend_rule`) to change the verdict.
 
         Args:
           event_id: the `id` of an event, as returned by `list_events` or in a
@@ -260,10 +260,10 @@ def register_cango_tools(mcp: FastMCP) -> None:
     async def list_series(source_id: str) -> dict[str, Any]:
         """List recent recurring series on a calendar source.
 
-        Use this when the user wants to add an attendance edge ("the kid
-        SOMETIMES_ATTENDS the Tuesday practice") — it surfaces the series ids
-        and titles to pick from. The edge itself is added to `family.yaml`, not
-        through this tool.
+        Use this when the user wants to add an attendance rule ("the kid
+        sometimes attends the Tuesday practice") — it surfaces the series ids
+        and titles to pick from. Record the rule with `record_rule` using a
+        `{person_id, series_id}` match.
 
         Args:
           source_id: the calendar source id to enumerate series for.
@@ -319,3 +319,111 @@ def register_cango_tools(mcp: FastMCP) -> None:
                 "all_day": all_day,
             },
         )
+
+    @mcp.tool()
+    async def list_rules(include_retracted: bool = False) -> dict[str, Any]:
+        """List the tiebreaker rules that adjust how events resolve. (Read.)
+
+        Rules are the editable layer between structural checks and the source
+        default: each maps a match to a role. Use this to see what's currently
+        teaching cango ("standups are soft", "she never attends Thursday
+        practice", "ignore my work calendar during vacation") before adding or
+        amending one.
+
+        Args:
+          include_retracted: also return retracted (soft-deleted) rules as
+            tombstones. Default False (active rules only).
+
+        Returns {"rules": [{"id", "match", "role", "effect", "reason",
+        "created_at", "updated_at", "retracted_at"?}], "degraded": bool,
+        "stale_sources": [str]}, or {"error": "cango_unavailable", ...}.
+        """
+        return await _cango_rpc("listRules", {"include_retracted": include_retracted})
+
+    @mcp.tool()
+    async def record_rule(
+        match: dict[str, Any],
+        role: str,
+        reason: str,
+        effect: str = "self",
+    ) -> dict[str, Any]:
+        """Create a tiebreaker rule that changes how matching events resolve.
+
+        Use this to persist a scheduling judgement the calendar can't express on
+        its own, so future verdicts reflect it without re-asking. Takes effect
+        immediately. Two non-obvious shapes worth knowing:
+
+        - **Attendance edge**: a rule whose `match` is `{person_id, series_id}`
+          is exactly the old attendance edge — e.g. role `inherit` = "attends,
+          treat as the calendar's normal weight", `soft` = "sometimes", `info` =
+          "never attends". Use `list_series` to find the series_id.
+        - **Out of office / vacation**: `effect="mask"` marks the matched event
+          as an OOO block; while it is happening, every *other* event on the
+          **same calendar (source)** is ignored (demoted to info). E.g.
+          `match={"source_id": "src-work", "title_regex": "(?i)vacation"}`,
+          `role="info"`, `effect="mask"` → "ignore my work calendar that week".
+
+        Args:
+          match: any of `person_id`, `source_id`, `series_id`, `title_regex`
+            (PCRE `(?i)` inline flags allowed), `organizer_is_self` (bool),
+            `rsvp_status_in` (list). Must constrain at least one field. When
+            several rules match an event the most specific (most fields) wins.
+          role: one of `hard`, `soft`, `info`, `conditional`, or `inherit`
+            (= fall through to the source default).
+          reason: short human explanation, surfaced in `explain_event`.
+          effect: `self` (default — set the matched event's own role) or `mask`
+            (the cross-event out-of-office behaviour above).
+
+        Returns {"rule": {...}, "degraded": bool, "stale_sources": [str]}, or
+        {"error": "cango_unavailable", "reason": str} (e.g. unknown source/person
+        or a bad title_regex).
+        """
+        return await _cango_rpc(
+            "createRule",
+            {"match": match, "role": role, "reason": reason, "effect": effect},
+        )
+
+    @mcp.tool()
+    async def amend_rule(
+        id: str,
+        match: dict[str, Any] | None = None,
+        role: str | None = None,
+        reason: str | None = None,
+        effect: str | None = None,
+    ) -> dict[str, Any]:
+        """Change an existing rule in place, keeping its id stable.
+
+        Use this to correct a rule rather than retiring and re-recording it
+        ("actually make standups hard now"). Only the fields you pass change;
+        omitted fields keep their current values. Amending a retracted rule is
+        rejected.
+
+        Args:
+          id: the rule id from `record_rule` / `list_rules`.
+          match: replacement match dict (same shape as `record_rule`), if changing.
+          role / effect / reason: new values, if changing.
+
+        Returns {"rule": {...}, "degraded": bool, "stale_sources": [str]}, or
+        {"error": "cango_unavailable", "reason": str} (e.g. unknown/retracted id).
+        """
+        return await _cango_rpc(
+            "amendRule",
+            {"id": id, "match": match, "role": role, "reason": reason, "effect": effect},
+        )
+
+    @mcp.tool()
+    async def forget_rule(id: str, reason: str | None = None) -> dict[str, Any]:
+        """Retract a rule (soft delete). It stops applying but is kept as a
+        tombstone for audit/undo, visible via `list_rules(include_retracted=True)`.
+
+        Use this when a rule no longer reflects reality ("she's back on the
+        Thursday squad — drop the never-attends rule").
+
+        Args:
+          id: the rule id from `record_rule` / `list_rules`.
+          reason: optional note on why it was retracted.
+
+        Returns {"rule": {...with retracted_at...}, "degraded": bool,
+        "stale_sources": [str]}, or {"error": "cango_unavailable", "reason": str}.
+        """
+        return await _cango_rpc("retractRule", {"id": id, "reason": reason})

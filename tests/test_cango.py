@@ -328,7 +328,7 @@ async def test_rpc_error_maps_to_unavailable(tools, socket_path):
 
 
 async def test_only_expected_tools_registered(tools):
-    """Read shims + the create_event write shim. reloadConfig/health excluded."""
+    """Read shims + create_event + rule CRUD. reloadConfig/health excluded."""
     assert set(tools) == {
         "check_availability",
         "find_free_slot",
@@ -336,4 +336,81 @@ async def test_only_expected_tools_registered(tools):
         "explain_event",
         "list_series",
         "create_event",
+        "list_rules",
+        "record_rule",
+        "amend_rule",
+        "forget_rule",
     }
+
+
+# ----------------- rule CRUD shims -----------------
+
+
+async def test_record_rule_roundtrip(tools, socket_path):
+    created = {"rule": {"id": "r1", "role": "soft", "effect": "self"}, "degraded": False}
+    daemon = await _with_daemon(socket_path, lambda m, p: created)
+    try:
+        result = await tools["record_rule"](
+            match={"title_regex": "(?i)standup"},
+            role="soft",
+            reason="optional",
+        )
+    finally:
+        await daemon.stop()
+
+    assert result == created
+    req = daemon.requests[0]
+    assert req["method"] == "createRule"
+    assert req["params"] == {
+        "match": {"title_regex": "(?i)standup"},
+        "role": "soft",
+        "reason": "optional",
+        "effect": "self",  # default applied client-side, always forwarded
+    }
+
+
+async def test_record_rule_mask_effect_forwarded(tools, socket_path):
+    daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r2"}})
+    try:
+        await tools["record_rule"](
+            match={"source_id": "src-work", "title_regex": "(?i)vacation"},
+            role="info",
+            reason="out of office",
+            effect="mask",
+        )
+    finally:
+        await daemon.stop()
+
+    assert daemon.requests[0]["params"]["effect"] == "mask"
+
+
+async def test_amend_rule_filters_unset_fields(tools, socket_path):
+    daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r1"}})
+    try:
+        await tools["amend_rule"](id="r1", role="hard")
+    finally:
+        await daemon.stop()
+
+    req = daemon.requests[0]
+    assert req["method"] == "amendRule"
+    # Only id + the changed field reach the daemon; None fields are filtered.
+    assert req["params"] == {"id": "r1", "role": "hard"}
+
+
+async def test_forget_rule_and_list_rules_method_names(tools, socket_path):
+    seen: list[str] = []
+
+    def responder(method, params):
+        seen.append(method)
+        return {"rules": []} if method == "listRules" else {"rule": {}}
+
+    daemon = await _with_daemon(socket_path, responder)
+    try:
+        await tools["list_rules"]()
+        await tools["forget_rule"](id="r1")
+    finally:
+        await daemon.stop()
+
+    assert seen == ["listRules", "retractRule"]
+    # list_rules default forwards include_retracted=False.
+    assert daemon.requests[0]["params"] == {"include_retracted": False}
