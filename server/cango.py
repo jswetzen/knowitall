@@ -281,6 +281,7 @@ def register_cango_tools(mcp: FastMCP) -> None:
         start: str,
         end: str,
         all_day: bool = False,
+        occupants: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a calendar event on a writable source. (Write tool.)
 
@@ -304,9 +305,19 @@ def register_cango_tools(mcp: FastMCP) -> None:
           end: ISO-8601 end. For all_day events this is *exclusive* — name the
             day after the last day (e.g. a 16–20 June trip ends 2026-06-21).
           all_day: whether this is a date-only, all-day event. Default false.
+          occupants: optional person/group ids who attend this *specific* event
+            beyond the calendar owner — e.g. ["wife"] for "add this to my
+            calendar but include my wife". Each person with a known email gets an
+            ATTENDEE line written into the event (so occupancy round-trips on the
+            next fetch); ids without an email are returned in `unwritten_occupants`
+            so you can add an email or a fan-out rule instead. For a *recurring*
+            household pattern (e.g. "the whole family may attend Saras läger"),
+            use `record_rule` with `effect="fanout"` rather than per-event
+            occupants here — see that tool.
 
         Returns {"event": {id, source_id, title, start, end, all_day,
-        resolved_role, ...}, "degraded": bool, "stale_sources": [str]}, or
+        resolved_role, occupants?, ...}, "unwritten_occupants"?: [str],
+        "degraded": bool, "stale_sources": [str]}, or
           {"error": "cango_unavailable", "reason": str}.
         """
         return await _cango_rpc(
@@ -317,6 +328,7 @@ def register_cango_tools(mcp: FastMCP) -> None:
                 "start": start,
                 "end": end,
                 "all_day": all_day,
+                "occupants": occupants,
             },
         )
 
@@ -346,12 +358,13 @@ def register_cango_tools(mcp: FastMCP) -> None:
         role: str,
         reason: str,
         effect: str = "self",
+        occupants: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a tiebreaker rule that changes how matching events resolve.
 
         Use this to persist a scheduling judgement the calendar can't express on
         its own, so future verdicts reflect it without re-asking. Takes effect
-        immediately. Two non-obvious shapes worth knowing:
+        immediately. Three non-obvious shapes worth knowing:
 
         - **Attendance edge**: a rule whose `match` is `{person_id, series_id}`
           is exactly the old attendance edge — e.g. role `inherit` = "attends,
@@ -362,6 +375,24 @@ def register_cango_tools(mcp: FastMCP) -> None:
           **same calendar (source)** is ignored (demoted to info). E.g.
           `match={"source_id": "src-work", "title_regex": "(?i)vacation"}`,
           `role="info"`, `effect="mask"` → "ignore my work calendar that week".
+        - **Household fan-out**: `effect="fanout"` with `occupants` makes a
+          matched event *also occupy other people*, so an event on one person's
+          calendar shows up on the others' availability. This is the way to model
+          "this is really a whole-family thing." Rules *add* attendance — plain
+          `self` rules can only re-weight or drop it. Fan-out is the right home
+          for *recurring / series-level* household patterns and for events on
+          read-only feeds you can't write ATTENDEE onto. For a one-off event you
+          are creating, prefer `create_event(occupants=...)` instead, so the
+          occupancy lives on the event and self-cleans.
+          Example — "the whole family may attend Saras läger; flag it, don't
+          hard-block the kids":
+            `match={"series_id": "lager-2026"}`, `role="soft"`,
+            `effect="fanout"`, `occupants=["family"]`.
+          Role on a fanout rule is the role the *added* occupants carry: `soft` =
+          "might go" (surfaces as a soft conflict — the right default for
+          uncertainty), `hard` = "definitely all going", `inherit` = same role
+          the event already has. The owner keeps their own (usually stronger)
+          role, so a camp can be hard for the parent and soft for the kids.
 
         Args:
           match: any of `person_id`, `source_id`, `series_id`, `title_regex`
@@ -371,16 +402,25 @@ def register_cango_tools(mcp: FastMCP) -> None:
           role: one of `hard`, `soft`, `info`, `conditional`, or `inherit`
             (= fall through to the source default).
           reason: short human explanation, surfaced in `explain_event`.
-          effect: `self` (default — set the matched event's own role) or `mask`
-            (the cross-event out-of-office behaviour above).
+          effect: `self` (default — set the matched event's own role), `mask`
+            (the cross-event out-of-office behaviour above), or `fanout` (add
+            `occupants` to the matched event).
+          occupants: required for `effect="fanout"` (and rejected otherwise) —
+            the person/group ids to add as occupants of the matched event(s).
 
         Returns {"rule": {...}, "degraded": bool, "stale_sources": [str]}, or
-        {"error": "cango_unavailable", "reason": str} (e.g. unknown source/person
-        or a bad title_regex).
+        {"error": "cango_unavailable", "reason": str} (e.g. unknown source/person,
+        a bad title_regex, or occupants on a non-fanout rule).
         """
         return await _cango_rpc(
             "createRule",
-            {"match": match, "role": role, "reason": reason, "effect": effect},
+            {
+                "match": match,
+                "role": role,
+                "reason": reason,
+                "effect": effect,
+                "occupants": occupants,
+            },
         )
 
     @mcp.tool()
@@ -390,6 +430,7 @@ def register_cango_tools(mcp: FastMCP) -> None:
         role: str | None = None,
         reason: str | None = None,
         effect: str | None = None,
+        occupants: list[str] | None = None,
     ) -> dict[str, Any]:
         """Change an existing rule in place, keeping its id stable.
 
@@ -402,13 +443,22 @@ def register_cango_tools(mcp: FastMCP) -> None:
           id: the rule id from `record_rule` / `list_rules`.
           match: replacement match dict (same shape as `record_rule`), if changing.
           role / effect / reason: new values, if changing.
+          occupants: for a `fanout` rule, the new occupant id list (replaces the
+            old one). Pass [] to clear it. Only valid on a fanout-effect rule.
 
         Returns {"rule": {...}, "degraded": bool, "stale_sources": [str]}, or
         {"error": "cango_unavailable", "reason": str} (e.g. unknown/retracted id).
         """
         return await _cango_rpc(
             "amendRule",
-            {"id": id, "match": match, "role": role, "reason": reason, "effect": effect},
+            {
+                "id": id,
+                "match": match,
+                "role": role,
+                "reason": reason,
+                "effect": effect,
+                "occupants": occupants,
+            },
         )
 
     @mcp.tool()

@@ -384,6 +384,55 @@ async def test_record_rule_mask_effect_forwarded(tools, socket_path):
     assert daemon.requests[0]["params"]["effect"] == "mask"
 
 
+async def test_record_rule_fanout_occupants_forwarded(tools, socket_path):
+    daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r3"}})
+    try:
+        await tools["record_rule"](
+            match={"series_id": "lager-2026"},
+            role="soft",
+            reason="family may attend camp",
+            effect="fanout",
+            occupants=["family"],
+        )
+    finally:
+        await daemon.stop()
+
+    params = daemon.requests[0]["params"]
+    assert params["effect"] == "fanout"
+    assert params["occupants"] == ["family"]
+
+
+async def test_record_rule_without_occupants_omits_them(tools, socket_path):
+    """A plain rule never sends occupants (None is filtered client-side)."""
+    daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r4"}})
+    try:
+        await tools["record_rule"](
+            match={"title_regex": "x"}, role="soft", reason="r"
+        )
+    finally:
+        await daemon.stop()
+
+    assert "occupants" not in daemon.requests[0]["params"]
+
+
+async def test_create_event_forwards_occupants(tools, socket_path):
+    created = {"event": {"id": "e1"}, "unwritten_occupants": ["p-kid"]}
+    daemon = await _with_daemon(socket_path, lambda m, p: created)
+    try:
+        result = await tools["create_event"](
+            source_id="src-cal",
+            title="Date night",
+            start="2026-06-16T19:00:00Z",
+            end="2026-06-16T22:00:00Z",
+            occupants=["wife", "p-kid"],
+        )
+    finally:
+        await daemon.stop()
+
+    assert result == created
+    assert daemon.requests[0]["params"]["occupants"] == ["wife", "p-kid"]
+
+
 async def test_amend_rule_filters_unset_fields(tools, socket_path):
     daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r1"}})
     try:
