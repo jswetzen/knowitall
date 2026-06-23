@@ -59,9 +59,14 @@ Thin shims over the sibling `cango-daemon` (Unix socket at `KNOWITALL_CANGO_SOCK
 |---|---|
 | `check_availability(start, end, people)` | "Can we go?" → `free` / `soft_conflict` / `hard_conflict` verdict + conflicts for a window across family calendars. |
 | `find_free_slot(duration_minutes, between_start, between_end, people, working_hours)` | Candidate free windows of a given length within a range. |
-| `list_events(start, end, people)` | Events in a window with their resolved roles and `resolved_by` trace reason. |
+| `list_events(start, end, people, extended, exclude_roles, limit, offset)` | Events in a window with their resolved roles; compact by default, `extended` adds Exchange ids + the full `resolved_by` trace. |
 | `explain_event(event_id)` | Layer-by-layer trace of how one event's role was resolved. |
-| `list_series(source_id)` | Recent recurring series on a source — input for adding attendance edges. |
+| `list_series(source_id)` | Recent recurring series on a source — input for adding attendance/fan-out rules. |
+| `create_event(source_id, title, start, end, all_day, occupants)` | Write an event to a `writable` CalDAV source. `occupants` adds per-event attendees (ATTENDEE for people with an email; others returned as `unwritten_occupants`). |
+| `list_rules(include_retracted)` | List the agent-managed tiebreaker rules — the mutable `state.db` layer that replaced static `rules.yaml`. |
+| `record_rule(match, role, reason, effect, occupants)` | Add a tiebreaker rule. `effect`: `self` (default) / `mask` (out-of-office) / `fanout` (add `occupants` → household fan-out). |
+| `amend_rule(id, match, role, reason, effect, occupants)` | Edit a rule in place, keeping its id stable. |
+| `forget_rule(id, reason)` | Retract a rule (soft delete; kept as a tombstone for audit/undo). |
 
 ### MCP prompts
 
