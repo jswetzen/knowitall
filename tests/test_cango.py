@@ -433,6 +433,29 @@ async def test_create_event_forwards_occupants(tools, socket_path):
     assert daemon.requests[0]["params"]["occupants"] == ["wife", "p-kid"]
 
 
+async def test_create_event_forwards_dict_occupants(tools, socket_path):
+    """Per-occupant role objects pass through the shim verbatim (no munging)."""
+    created = {"event": {"id": "e2"}, "unwritten_occupants": ["kid"]}
+    daemon = await _with_daemon(socket_path, lambda m, p: created)
+    try:
+        result = await tools["create_event"](
+            source_id="src-cal",
+            title="Saras läger",
+            start="2026-06-16T09:00:00Z",
+            end="2026-06-16T17:00:00Z",
+            occupants=[{"id": "wife", "role": "soft"}, "kid"],
+        )
+    finally:
+        await daemon.stop()
+
+    assert result == created
+    # The mixed bare-string / role-object shape arrives exactly as passed.
+    assert daemon.requests[0]["params"]["occupants"] == [
+        {"id": "wife", "role": "soft"},
+        "kid",
+    ]
+
+
 async def test_amend_rule_filters_unset_fields(tools, socket_path):
     daemon = await _with_daemon(socket_path, lambda m, p: {"rule": {"id": "r1"}})
     try:

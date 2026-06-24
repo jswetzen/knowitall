@@ -196,8 +196,8 @@ def register_cango_tools(mcp: FastMCP) -> None:
         """List calendar events in a window with their resolved roles.
 
         Use this to see *what's actually on the calendar* for a window — each
-        event carries its resolved role (hard/soft/info/conditional). Good for
-        explaining a verdict or eyeballing a day.
+        event carries its resolved role (hard/soft/info). Good for explaining a
+        verdict or eyeballing a day.
 
         Output is **compact by default** (a full-month window is one call): the
         large Exchange GUIDs (`id`, `series_id`) are omitted, and
@@ -281,7 +281,7 @@ def register_cango_tools(mcp: FastMCP) -> None:
         start: str,
         end: str,
         all_day: bool = False,
-        occupants: list[str] | None = None,
+        occupants: list[str | dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Create a calendar event on a writable source. (Write tool.)
 
@@ -307,13 +307,20 @@ def register_cango_tools(mcp: FastMCP) -> None:
           all_day: whether this is a date-only, all-day event. Default false.
           occupants: optional person/group ids who attend this *specific* event
             beyond the calendar owner — e.g. ["wife"] for "add this to my
-            calendar but include my wife". Each person with a known email gets an
-            ATTENDEE line written into the event (so occupancy round-trips on the
-            next fetch); ids without an email are returned in `unwritten_occupants`
-            so you can add an email or a fan-out rule instead. For a *recurring*
-            household pattern (e.g. "the whole family may attend Saras läger"),
-            use `record_rule` with `effect="fanout"` rather than per-event
-            occupants here — see that tool.
+            calendar but include my wife". Each entry is either a bare id string
+            (defaults to role `hard` = "attending") OR an object carrying a
+            per-occupant role, `{"id": "<person/group id>", "role": "hard"|"soft"|"info"}`.
+            Use `{"id": "wife", "role": "soft"}` for "might go" (surfaces as a
+            soft conflict, not a hard block); `hard` is "attending" and is the
+            bare-string default. The per-event role is written onto the calendar
+            event itself, so it round-trips on the next fetch. Mixing shapes is
+            fine, e.g. `[{"id": "wife", "role": "soft"}, "kid"]`. Each person
+            with a known email gets an ATTENDEE line written into the event;
+            ids without an email are still applied but come back in
+            `unwritten_occupants` so you can add an email or a fan-out rule
+            instead. For a *recurring* household pattern (e.g. "the whole family
+            may attend Saras läger"), use `record_rule` with `effect="fanout"`
+            rather than per-event occupants here — see that tool.
 
         Returns {"event": {id, source_id, title, start, end, all_day,
         resolved_role, occupants?, ...}, "unwritten_occupants"?: [str],
@@ -375,31 +382,41 @@ def register_cango_tools(mcp: FastMCP) -> None:
           **same calendar (source)** is ignored (demoted to info). E.g.
           `match={"source_id": "src-work", "title_regex": "(?i)vacation"}`,
           `role="info"`, `effect="mask"` → "ignore my work calendar that week".
-        - **Household fan-out**: `effect="fanout"` with `occupants` makes a
-          matched event *also occupy other people*, so an event on one person's
-          calendar shows up on the others' availability. This is the way to model
-          "this is really a whole-family thing." Rules *add* attendance — plain
-          `self` rules can only re-weight or drop it. Fan-out is the right home
-          for *recurring / series-level* household patterns and for events on
-          read-only feeds you can't write ATTENDEE onto. For a one-off event you
-          are creating, prefer `create_event(occupants=...)` instead, so the
-          occupancy lives on the event and self-cleans.
+        - **Household fan-out**: `effect="fanout"` with `occupants` adjusts how a
+          matched event occupies *named people*, so an event on one person's
+          calendar shows up on (or drops off) the others' availability. This is
+          the way to model "this is really a whole-family thing." A fanout rule
+          can *raise*, *lower*, or *remove* a named occupant; when several fanout
+          rules touch the same occupant on the same event, the **most specific
+          rule (most match fields) wins per occupant** — so a broad family rule
+          and a narrow per-person rule can disagree and the narrow one decides.
+          Fan-out is the right home for *recurring / series-level* household
+          patterns and for events on read-only feeds you can't write ATTENDEE
+          onto. For a one-off event you are creating, prefer
+          `create_event(occupants=...)` instead, so the occupancy lives on the
+          event and self-cleans.
           Example — "the whole family may attend Saras läger; flag it, don't
           hard-block the kids":
             `match={"series_id": "lager-2026"}`, `role="soft"`,
             `effect="fanout"`, `occupants=["family"]`.
-          Role on a fanout rule is the role the *added* occupants carry: `soft` =
+          Role on a fanout rule is the role the *named* occupants carry: `soft` =
           "might go" (surfaces as a soft conflict — the right default for
-          uncertainty), `hard` = "definitely all going", `inherit` = same role
-          the event already has. The owner keeps their own (usually stronger)
-          role, so a camp can be hard for the parent and soft for the kids.
+          uncertainty), `hard` = "definitely going" (raises them), `inherit` =
+          same role the event already has, and `info` *removes* that occupant
+          from the verdict — the "doesn't really attend" / demote-or-remove
+          primitive (e.g. fan a camp onto the family but `info` the kid who's
+          staying home). The calendar owner is protected from a group-driven
+          demotion: a rule that fans onto a *group* won't lower or remove the
+          owner unless the owner is named literally in `occupants`. The owner
+          otherwise keeps their own (usually stronger) role, so a camp can be
+          hard for the parent and soft for the kids.
 
         Args:
           match: any of `person_id`, `source_id`, `series_id`, `title_regex`
             (PCRE `(?i)` inline flags allowed), `organizer_is_self` (bool),
             `rsvp_status_in` (list). Must constrain at least one field. When
             several rules match an event the most specific (most fields) wins.
-          role: one of `hard`, `soft`, `info`, `conditional`, or `inherit`
+          role: one of `hard`, `soft`, `info`, or `inherit`
             (= fall through to the source default).
           reason: short human explanation, surfaced in `explain_event`.
           effect: `self` (default — set the matched event's own role), `mask`
@@ -442,7 +459,11 @@ def register_cango_tools(mcp: FastMCP) -> None:
         Args:
           id: the rule id from `record_rule` / `list_rules`.
           match: replacement match dict (same shape as `record_rule`), if changing.
-          role / effect / reason: new values, if changing.
+          role / effect / reason: new values, if changing. On a `fanout` rule the
+            `role` is what the named occupants carry — `hard`/`soft` raise or
+            lower them, `info` removes them from the verdict, `inherit` matches
+            the event (see `record_rule`'s fan-out notes; most-specific rule wins
+            per occupant, and the owner is protected from a group-driven demote).
           occupants: for a `fanout` rule, the new occupant id list (replaces the
             old one). Pass [] to clear it. Only valid on a fanout-effect rule.
 
