@@ -6,7 +6,7 @@ from starlette.responses import JSONResponse
 
 from server import config
 
-OPEN_PATHS = {"/healthz"}
+OPEN_PATHS = {"/healthz", "/.well-known/oauth-protected-resource"}
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):

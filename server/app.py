@@ -47,6 +47,16 @@ def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(BearerTokenMiddleware)
 
+    if config.settings.oauth_resource_url and config.settings.oauth_authorization_server:
+
+        @app.get("/.well-known/oauth-protected-resource")
+        async def oauth_protected_resource():
+            return {
+                "resource": config.settings.oauth_resource_url,
+                "authorization_servers": [config.settings.oauth_authorization_server],
+                "bearer_methods_supported": ["header"],
+            }
+
     @app.get("/healthz")
     async def healthz():
         kuzu_rows = 0
