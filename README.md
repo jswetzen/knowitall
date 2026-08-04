@@ -28,8 +28,10 @@ A small HTTP MCP server you run on your own box. Claude Code connects to it
 over your LAN/VPN with a bearer token.
 
 - **Graph:** Kùzu (embedded, file-based, Cypher). Closed schema spanning
-  ~14 node types and ~20 bi-temporal edges, including a generic
-  `ANCHORED_TO` citation edge. See `PLAN.md` §3 and `PLAN_V2.md`.
+  ~13 node types and ~24 bi-temporal edges, including a generic
+  `ANCHORED_TO` citation edge. See `PLAN.md` §3 and `PLAN_V2.md` for
+  design history — where they disagree with `schema/*.cypher` or the
+  `cypher` tool's docstring, the schema files and docstring win.
 - **Vectors:** LanceDB (embedded, Arrow-native). One union `embeddings`
   table — one similarity search ranks across Episodes, Decisions, Tasks,
   Ideas, Notes, Concepts.
@@ -42,7 +44,7 @@ over your LAN/VPN with a bearer token.
 
 | Tool | Purpose |
 |---|---|
-| `record(kind, body, project_hint, anchors, summary, relates_to)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, solution, episode}. `solution` is for env/setup/config gotchas — lead the body with the verbatim error string. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. Optional `summary` is a ≤200-char title-shaped string (falls back to first 200 of body). Optional `relates_to` writes memory→memory edges (kinds: supersedes/refines/contradicts/relates_to). |
+| `record(kind, body, project_hint, anchors, summary, relates_to)` | Save a durable memory. `kind` ∈ {decision, task, idea, note, summary, blocker, fact, solution, episode}. **`note` is a short title-only label (≤200 chars); a longer body is rejected — use `fact`/`idea`/`decision`/`task` instead.** `solution` is for env/setup/config gotchas — lead the body with the verbatim error string. `anchors` are typed JSON citations (commit/file/symbol/project/concept/person) that create graph edges. Optional `summary` is a ≤200-char title-shaped string (falls back to first 200 of body). Optional `relates_to` writes memory→memory edges (kinds: supersedes/refines/contradicts/relates_to/blocks). |
 | `query_memory(query, project_hint, k, expand_hops=0, snippet_chars=240, include_retracted, node_types)` | Semantic search. Defaults: bodies clipped to 240 chars + ellipsis, no neighbor expansion. Pass `expand_hops=1` for ANCHORED_TO neighbors; pass `snippet_chars=0` for full bodies. |
 | `list_memories(kind, project_hint, limit, offset, order_by, include_retracted)` | Enumerate memories without semantic ranking. Returns summaries only; use `get_memory` to fetch full bodies. |
 | `get_memory(id, include_neighbors)` | Fetch a memory by id. Returns full body + summary + metadata. Surfaces retracted nodes with `retracted_at` populated. |

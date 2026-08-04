@@ -103,6 +103,13 @@ These came out of a long Q&A with the user. Do not relitigate without reason.
 
 DDL lives in `schema/v1.cypher`. Migrations are forward-only files applied in order.
 
+> **Staleness note:** this section is the v1 design as scoped for week 1.
+> The live schema is v0→v3 (`schema/*.cypher`), and later PRs changed some
+> of this without a rewrite here (see the `Note` row below for the sharpest
+> example). Where this section and the schema files disagree, the schema
+> files and the `cypher` MCP tool's docstring (`server/mcp_tools.py`) are
+> authoritative — treat this table as historical intent, not current truth.
+
 ### Node types (~13)
 
 | Node | Purpose | Key fields |
@@ -112,7 +119,7 @@ DDL lives in `schema/v1.cypher`. Migrations are forward-only files applied in or
 | `File` | A file in a repo | `id, repo_id, path` |
 | `Symbol` | Function/class/etc. from tree-sitter | `id, file_id, name, kind, line` |
 | `Commit` | A git commit | `sha, repo_id, message, authored_at` |
-| `Note` | A markdown note (Joplin/`~/notes`) | `id, path, title, created_at` |
+| `Note` | ~~A markdown note (Joplin/`~/notes`)~~ **SUPERSEDED (v2):** a short title-only memory node written via `record(kind="note")`. The `path`/Joplin-importer design below was never built — `path` is always NULL in practice — and every real Note today is ad-hoc prose capped at 200 chars, same shape as a short `title`. | `id, path, title, created_at` |
 | `Conversation` | One Claude Code session | `session_uuid, project_id, started_at` |
 | `ConversationTurn` | One user↔assistant exchange | `id, conversation_id, role, text, ts` |
 | `Decision` | A recorded decision | `id, body, decided_at` (manual or future-extracted) |

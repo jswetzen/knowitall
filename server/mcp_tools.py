@@ -71,8 +71,8 @@ MEMORY_KIND_TO_LABEL: dict[str, str] = {
 # it under a uniform alias. `body_field` is the column whose first
 # SUMMARY_MAX_LEN chars become the fallback summary. `summary_field` is the
 # stored summary column when present; Note has no parallel `summary` column
-# because `title` already serves that purpose, so `summary_field == "title"`
-# and `_summarize_with_fallback` resolves it without a body fallback.
+# because `title` already serves that purpose, so `summary_field` is None and
+# `_effective_summary` resolves it from `body_field` (== "title") instead.
 _LIST_FIELDS: dict[str, dict[str, str | None]] = {
     "Decision": {"created_at_field": "decided_at", "body_field": "body",  "summary_field": "summary"},
     "Task":     {"created_at_field": "created_at", "body_field": "body",  "summary_field": "summary"},
@@ -557,6 +557,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             Episode nodes carrying the kind, for less structural / more
             narrative content.
 
+        kind="note" is the odd one out: a Note stores ONLY a short,
+        standalone title/label (<=200 chars, `SUMMARY_MAX_LEN`) — there is
+        no separate long-body column. A body over 200 chars is REJECTED
+        (ValueError) rather than silently clipped — use "fact" (general
+        knowledge), "idea", "decision", or "task" for anything longer than
+        a title. (History: `note` was originally designed as a pointer to
+        an external markdown file via a `path` field; that importer was
+        never built, `path` is always NULL today, and a note is just a
+        short graph-native label.)
+
         kind="solution" body shape (FOLLOW THIS — semantic retrieval depends
         on it):
           Line 1: the verbatim error string or exact symptom (paste it,
@@ -626,7 +636,9 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         back to the first 200 chars of body. Validation rejects strings
         longer than SUMMARY_MAX_LEN — fail at write-time rather than
         silently truncate. For `kind="note"` the summary writes to the
-        existing `title` column (Note has no parallel summary field).
+        existing `title` column (Note has no parallel summary field) —
+        since a Note IS its title, `summary` and `body` are two names for
+        the same ≤200-char string on a Note.
 
         relates_to: optional list of memory→memory edges to write. Each
         entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to"|
@@ -650,6 +662,14 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             )
         label = KIND_TO_LABEL[kind]
         node_type = NODE_TYPE_BY_KIND[kind]
+        if label == "Note" and len(body) > SUMMARY_MAX_LEN:
+            raise ValueError(
+                f"note body is {len(body)} chars but a Note only stores a "
+                f"{SUMMARY_MAX_LEN}-char title; the remainder would be "
+                "dropped. Use kind=\"fact\" (or \"idea\"/\"decision\"/"
+                "\"task\") for content longer than a title, and reserve "
+                "kind=\"note\" for short title-shaped labels."
+            )
 
         with profile("record") as p:
             with p.stage("embed"):
@@ -842,7 +862,11 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
           id: the node id returned by `record` / `list_memories`.
           body: if provided, replaces the stored body AND re-embeds. The
             old embedding row is deleted and a fresh one inserted, so
-            subsequent `query_memory` calls reflect the new wording.
+            subsequent `query_memory` calls reflect the new wording. For
+            `kind="note"`, body must stay <=200 chars (a Note is
+            title-only) — a longer amended body is REJECTED; to keep
+            longer content, record a new "fact"/"idea"/"decision"/"task"
+            and `forget` the note instead of growing it past a title.
           summary: if provided, replaces the stored summary. Pure graph
             SET — no re-embed (summary is not part of the embedded text).
             For `kind=note` the value writes to `title`. Validated against
@@ -891,7 +915,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         re_embedded = False
         if body is not None:
-            # Note's body lives in `title` and is clipped at SUMMARY_MAX_LEN.
+            if label == "Note" and len(body) > SUMMARY_MAX_LEN:
+                raise ValueError(
+                    f"amended note body is {len(body)} chars but a Note "
+                    f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
+                    "longer content, record a new kind=\"fact\"/\"idea\"/"
+                    "\"decision\"/\"task\" and forget this note; don't "
+                    "grow a note past a title."
+                )
+            # Note's body lives in `title`, clipped at SUMMARY_MAX_LEN — a
+            # no-op now that the length is validated above.
             stored_body = body[:SUMMARY_MAX_LEN] if label == "Note" else body
             conn.execute(
                 f"MATCH (n:{label} {{id: $id}}) SET n.{body_field} = $b",
@@ -900,47 +933,53 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             # Delete-then-insert in LanceDB. Updating the fixed-size vector
             # column via `update(values={vector: ...})` is not battle-tested;
             # the safe path is to drop the old row entirely and re-embed.
-            # Only memory kinds that embed land in LanceDB — Note doesn't
-            # appear in the embeddings table by way of `record`, so a delete
-            # over a missing id is a harmless no-op.
+            # `record()` embeds every kind unconditionally, Note included
+            # (see `_insert_embedding_row` call in `record()`), so there is
+            # always a row here to replace — re-embed below runs for every
+            # label, or the delete above would silently destroy a note's
+            # only full-text copy (this used to be skipped for Note, which
+            # was the actual bug: it deleted the row and never put one back).
             try:
                 state.embeddings.delete(f"id = '{id}'")
             except Exception:
                 pass
-            if label != "Note":
-                vec = await embed(state.http, body)
-                if len(vec) != config.settings.embedding_dim:
-                    raise RuntimeError(
-                        f"embedding dim mismatch: got {len(vec)}, "
-                        f"configured {config.settings.embedding_dim}"
-                    )
-                # project_id is the optional ANCHORED_TO Project — re-derive.
-                pid_res = conn.execute(
-                    f"MATCH (n:{label} {{id: $id}})-[:ANCHORED_TO]->(p:Project) "
-                    f"RETURN p.id LIMIT 1",
-                    {"id": id},
+            vec = await embed(state.http, body)
+            if len(vec) != config.settings.embedding_dim:
+                raise RuntimeError(
+                    f"embedding dim mismatch: got {len(vec)}, "
+                    f"configured {config.settings.embedding_dim}"
                 )
-                project_id = (
-                    str(pid_res.get_next()[0]) if pid_res.has_next() else None
-                )
-                kind_res = conn.execute(
-                    f"MATCH (n:{label} {{id: $id}}) "
-                    f"RETURN {'n.kind' if label == 'Episode' else 'NULL'} LIMIT 1",
-                    {"id": id},
-                )
-                row = kind_res.get_next() if kind_res.has_next() else [None]
-                stored_kind = row[0] if label == "Episode" else None
-                _insert_embedding_row(
-                    state,
-                    row_id=id,
-                    node_type=node_type,
-                    text=body,
-                    vec=vec,
-                    project_id=project_id,
-                    kind=stored_kind,
-                    created_at=now,
-                )
-                re_embedded = True
+            # project_id is the optional ANCHORED_TO Project — re-derive.
+            pid_res = conn.execute(
+                f"MATCH (n:{label} {{id: $id}})-[:ANCHORED_TO]->(p:Project) "
+                f"RETURN p.id LIMIT 1",
+                {"id": id},
+            )
+            project_id = (
+                str(pid_res.get_next()[0]) if pid_res.has_next() else None
+            )
+            kind_res = conn.execute(
+                f"MATCH (n:{label} {{id: $id}}) "
+                f"RETURN {'n.kind' if label == 'Episode' else 'NULL'} LIMIT 1",
+                {"id": id},
+            )
+            row = kind_res.get_next() if kind_res.has_next() else [None]
+            # Episode preserves its sub-kind (fact/solution/...); every
+            # other label's Lance `kind` column mirrors node_type, same as
+            # record() does (kind=kind there, which equals node_type for
+            # graph-node kinds).
+            stored_kind = row[0] if label == "Episode" else node_type
+            _insert_embedding_row(
+                state,
+                row_id=id,
+                node_type=node_type,
+                text=body,
+                vec=vec,
+                project_id=project_id,
+                kind=stored_kind,
+                created_at=now,
+            )
+            re_embedded = True
 
         if summary is not None:
             if summary_field is not None:
@@ -1393,6 +1432,28 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 retracted_at.isoformat() if retracted_at is not None else None
             ),
         }
+        if label == "Note" and body_value is not None and len(body_value) >= SUMMARY_MAX_LEN:
+            # Legacy over-length note (recorded/amended before the
+            # reject-loud validation existed): the graph title is clipped
+            # at SUMMARY_MAX_LEN, but `record()` always wrote the full body
+            # into the Lance embeddings row's `text` column too. Recover it
+            # if that row is still there — best-effort, degrades to the
+            # clipped title if not. Filters on `text` (model-independent),
+            # so a stale `model_version` or a retracted row doesn't matter.
+            try:
+                lance_rows = (
+                    state.embeddings.search()
+                    .where(f"id = '{id}'")
+                    .select(["text"])
+                    .limit(1)
+                    .to_arrow()
+                )
+            except Exception:
+                lance_rows = None
+            if lance_rows is not None and lance_rows.num_rows:
+                full_text = lance_rows.column("text")[0].as_py()
+                if full_text and len(full_text) > len(body_value):
+                    out["body"] = full_text
         if include_neighbors:
             out["neighbors"] = _expand_neighbors(conn, label, id, 1)
         return out

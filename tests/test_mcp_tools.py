@@ -638,6 +638,65 @@ async def test_get_memory_include_neighbors(tools, fake_embed):
     assert "File" in labels
 
 
+async def test_get_memory_note_recovers_full_body_from_lance_fallback(
+    tools, fake_embed
+):
+    # Simulates a note that predates the reject-loud validation: the graph
+    # title is clipped to SUMMARY_MAX_LEN, but a Lance row with the full
+    # body still exists (record() always embedded the full body, even for
+    # notes). get_memory should recover it rather than only ever returning
+    # the clipped title.
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from server.mcp_tools import _create_graph_node, _insert_embedding_row
+
+    fns, state = tools
+    node_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    long_body = "b" * 500
+    conn = state.kuzu_conn()
+    _create_graph_node(
+        conn, label="Note", node_id=node_id, body=long_body, kind="note",
+        created_at=now,
+    )
+    vec = [0.01 * (i % 100) for i in range(768)]
+    _insert_embedding_row(
+        state, row_id=node_id, node_type="note", text=long_body, vec=vec,
+        project_id=None, kind="note", created_at=now,
+    )
+
+    got = await fns["get_memory"](id=node_id)
+    assert got is not None
+    assert got["body"] == long_body
+    assert got["summary"] == "b" * 200  # title stays the clipped 200 chars
+
+
+async def test_get_memory_note_without_lance_row_returns_clipped_title(
+    tools, fake_embed
+):
+    # If no Lance row survives for a legacy over-length note (e.g. it was
+    # amended pre-fix and the row was deleted without a reinsert), get_memory
+    # must degrade gracefully to the clipped graph title, not error out.
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from server.mcp_tools import _create_graph_node
+
+    fns, state = tools
+    node_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    conn = state.kuzu_conn()
+    _create_graph_node(
+        conn, label="Note", node_id=node_id, body="c" * 500, kind="note",
+        created_at=now,
+    )
+
+    got = await fns["get_memory"](id=node_id)
+    assert got is not None
+    assert got["body"] == "c" * 200
+
+
 async def test_get_memory_works_for_each_kind(tools, fake_embed):
     fns, _ = tools
     for kind in ("decision", "task", "idea", "note", "fact"):
@@ -690,6 +749,19 @@ async def test_record_summary_routes_to_note_title(tools, fake_embed):
     # explicit summary should win over body-fallback.
     assert got["body"] == "short title"
     assert got["summary"] == "short title"
+
+
+async def test_record_note_rejects_oversize_body(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="note body is"):
+        await fns["record"](kind="note", body="a" * 201)
+
+
+async def test_record_note_allows_body_at_exactly_max_len(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="note", body="a" * 200)
+    got = await fns["get_memory"](id=out["id"])
+    assert got["body"] == "a" * 200
 
 
 # ----------------- relates_to edges on record -----------------
@@ -927,6 +999,51 @@ async def test_amend_episode_preserves_kind_through_re_embed(tools, fake_embed):
     matching = [r for r in rows if r["hit"]["id"] == out["id"]]
     assert len(matching) == 1
     assert matching[0]["hit"]["kind"] == "fact"
+
+
+async def test_amend_decision_preserves_node_type_as_kind_through_re_embed(
+    tools, fake_embed
+):
+    fns, _ = tools
+    # Non-Episode labels aren't Episode-flavored, but their Lance `kind`
+    # column should still mirror node_type (as record() sets it), not be
+    # wiped to NULL by a re-embed.
+    out = await fns["record"](kind="decision", body="d", project_hint="ap")
+    await fns["amend"](id=out["id"], body="d2")
+    rows = await fns["query_memory"](query="x", project_hint="ap")
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["kind"] == "decision"
+
+
+async def test_amend_note_rejects_oversize_body(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="note", body="short")
+    with pytest.raises(ValueError, match="amended note body is"):
+        await fns["amend"](id=out["id"], body="a" * 201)
+
+
+async def test_amend_note_re_embeds_and_stays_searchable(tools, fake_embed):
+    fns, _ = tools
+    # Regression test: amend() used to delete a Note's Lance row and never
+    # reinsert it, silently destroying its only full-text copy and making
+    # it permanently unsearchable via query_memory.
+    out = await fns["record"](
+        kind="note", body="original title", project_hint="np"
+    )
+    res = await fns["amend"](id=out["id"], body="renamed title")
+    assert res["re_embedded"] is True
+
+    rows = await fns["query_memory"](
+        query="x", project_hint="np", node_types=["note"]
+    )
+    matching = [r for r in rows if r["hit"]["id"] == out["id"]]
+    assert len(matching) == 1
+    assert matching[0]["hit"]["text"] == "renamed title"
+    assert matching[0]["hit"]["kind"] == "note"
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["body"] == "renamed title"
 
 
 async def test_solution_kind_round_trips_as_episode(tools, fake_embed):
