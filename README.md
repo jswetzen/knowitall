@@ -53,6 +53,17 @@ over your LAN/VPN with a bearer token.
 | `forget(id, reason)` | Soft undo — sets `retracted_at`; default queries hide it. |
 | `cypher(query, params)` | Read-only Cypher passthrough over the graph. |
 
+#### Scoping memories across projects
+
+`record`'s `anchors` accepts multiple `{"kind":"project",...}`/`{"kind":"concept",...}` entries — there's no "primary" project; the graph is the source of truth and the memory surfaces under every anchor's `query_memory`/`list_memories` hint. Two idioms:
+
+- **Internal library used across repos** (e.g. an in-house `mycelium` package consumed by `aa-SDK` and `powerfactors-api`):
+  `anchors=[{"kind":"project","name":"mycelium"}, {"kind":"project","name":"aa-SDK"}, {"kind":"project","name":"powerfactors-api"}]`.
+  Future `query_memory(anchor_hint={"kind":"project","name":X})` finds it under any of those names.
+- **Public library / framework knowledge** (a Kùzu pitfall, a Pydantic recipe, a fix you don't want to re-derive): tag with a concept anchor named after the library/topic, plus optionally the consumer project(s):
+  `anchors=[{"kind":"concept","name":"kuzu"}, {"kind":"project","name":"knowitall"}]`.
+  Future `query_memory(anchor_hint={"kind":"concept","name":"kuzu"})` finds it regardless of which repo you're in next.
+
 #### Calendar (Cango) shims
 
 Thin shims over the sibling `cango-daemon` (Unix socket at `KNOWITALL_CANGO_SOCKET`, default `/run/cango/cango.sock`). No calendar logic lives in knowitall; these marshal JSON-RPC and pass the daemon's answer through. If the daemon is down or the socket is missing, each returns `{"error": "cango_unavailable", "reason": ...}` — memory tools are unaffected.
@@ -69,6 +80,9 @@ Thin shims over the sibling `cango-daemon` (Unix socket at `KNOWITALL_CANGO_SOCK
 | `record_rule(match, role, reason, effect, occupants)` | Add a tiebreaker rule. `effect`: `self` (default) / `mask` (out-of-office) / `fanout` (add `occupants` → household fan-out). |
 | `amend_rule(id, match, role, reason, effect, occupants)` | Edit a rule in place, keeping its id stable. |
 | `forget_rule(id, reason)` | Retract a rule (soft delete; kept as a tombstone for audit/undo). |
+
+**Fan-out worked example** — "the whole family may attend Saras läger; flag it, don't hard-block the kids":
+`record_rule(match={"series_id":"lager-2026"}, role="soft", effect="fanout", occupants=["family"])`.
 
 ### MCP prompts
 

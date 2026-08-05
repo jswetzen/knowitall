@@ -158,6 +158,12 @@ def _create_graph_node(
     arg because its `title` column already serves the title-shaped role —
     Note's title is computed as the first SUMMARY_MAX_LEN chars of body if
     no explicit summary was passed, else the explicit summary (also clipped).
+
+    History: Note was originally designed (PLAN.md v1) as a pointer to an
+    external markdown file via a `path` field, with `title` just a label.
+    That importer was never built — `path` is always NULL — so in practice
+    every Note is ad-hoc prose via `record(kind="note")`, capped at a
+    title's length. PLAN.md's Note row is annotated SUPERSEDED accordingly.
     """
     if label == "Episode":
         conn.execute(
@@ -543,29 +549,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         or code, scratchpad thinking, or speculative ideas the user hasn't
         endorsed.
 
-        For shared/cross-cutting knowledge (internal libraries used in
-        multiple repos, public-library recipes, framework gotchas) MULTI-
-        ANCHOR: pass several `{"kind":"project","name":...}` and/or
-        `{"kind":"concept","name":...}` entries in `anchors`. The same
-        memory then surfaces under each anchor's hint in `query_memory`/
-        `list_memories`. See SCOPING below.
-
         kind taxonomy:
           - "decision" | "task" | "idea" | "note": become first-class graph
             nodes (citable, expandable, can be the target of edges).
           - "summary" | "blocker" | "fact" | "solution" | "episode": become
             Episode nodes carrying the kind, for less structural / more
             narrative content.
-
-        kind="note" is the odd one out: a Note stores ONLY a short,
-        standalone title/label (<=200 chars, `SUMMARY_MAX_LEN`) — there is
-        no separate long-body column. A body over 200 chars is REJECTED
-        (ValueError) rather than silently clipped — use "fact" (general
-        knowledge), "idea", "decision", or "task" for anything longer than
-        a title. (History: `note` was originally designed as a pointer to
-        an external markdown file via a `path` field; that importer was
-        never built, `path` is always NULL today, and a note is just a
-        short graph-native label.)
+          - "note" is title-only: <=200 chars, no long body column. A body
+            over 200 chars is REJECTED — use "fact"/"idea"/"decision"/"task"
+            for anything longer than a title (see PLAN.md for why `note`
+            is shaped this way).
 
         kind="solution" body shape (FOLLOW THIS — semantic retrieval depends
         on it):
@@ -586,50 +579,17 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         body: self-contained prose. Must be readable without surrounding chat.
 
         project_hint: project NAME (not id). If novel, a Project node is
-        created. Omit to leave unattached. Stored on the embedding row for
-        filter pushdown AND linked as an ANCHORED_TO edge in the graph.
+        created. Omit to leave unattached.
 
-        anchors: list of typed JSON objects citing where this memory came
-        from. Shapes:
-          {"kind": "commit", "sha": "abc123", "repo": "myrepo",
-           "message": "...", "authored_at": "2026-05-15T...",
-           "author_email": "..."}
-          {"kind": "file",   "repo": "myrepo", "path": "server/app.py"}
-          {"kind": "symbol", "repo": "myrepo", "file": "server/app.py",
-           "name": "create_app", "line": 14}
-          {"kind": "project", "name": "myrepo"}
-          {"kind": "concept", "name": "rate limiting"}
-          {"kind": "person",  "email": "claude@swetzen.com"}
-        Existing nodes are reused by natural key (sha / (repo,path) / email /
-        name). Sparse anchors are accepted — backfill is a client concern.
-
-        SCOPING — anchor to make memory findable later:
-
-          Internal library used across repos (e.g. an in-house mycelium
-          package consumed by aa-SDK and powerfactors-api):
-            anchors=[
-              {"kind":"project", "name":"mycelium"},
-              {"kind":"project", "name":"aa-SDK"},
-              {"kind":"project", "name":"powerfactors-api"},
-            ]
-          Future `query_memory(anchor_hint={"kind":"project","name":X})`
-          finds the entry under any of those names.
-
-          Public library / framework knowledge (e.g. a kuzu pitfall, a
-          pydantic recipe, a stackoverflow-shaped fix you don't want to
-          re-derive): tag with a concept anchor named after the library
-          or topic, plus optionally the consumer projects where you hit
-          it.
-            anchors=[
-              {"kind":"concept", "name":"kuzu"},
-              {"kind":"project", "name":"knowitall"},
-            ]
-          Future `query_memory(anchor_hint={"kind":"concept","name":
-          "kuzu"})` finds it regardless of which repo you're in next.
-
-          Multi-anchoring is the idiom for shared knowledge. There is no
-          "primary" project; the graph is the source of truth and the
-          memory surfaces under every anchor's hint.
+        anchors: typed JSON citations, e.g. {"kind":"commit","sha":...,
+        "repo":...}, {"kind":"file","repo":...,"path":...},
+        {"kind":"project","name":...}, {"kind":"concept","name":...}
+        (less common: "symbol", "person" — shapes in README). Existing
+        nodes are reused by natural key. Pass MULTIPLE project/concept
+        anchors to scope shared/cross-cutting knowledge (an internal
+        library, a framework gotcha) so it surfaces under every anchor's
+        `query_memory`/`list_memories` hint — worked examples in README's
+        "Scoping memories across projects".
 
         summary: optional ≤200-char title-shaped string surfaced by
         `list_memories` and `get_memory`. If omitted, those tools fall
@@ -1048,72 +1008,44 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         neighbors — both are opt-in to keep the MCP output budget small.
 
         Memory is shared across every AI tool connected to this knowitall
-        server, so a fix discovered in one tool is recoverable from any
-        other — but only if you search for it.
+        server — call PROACTIVELY, not just when asked: session start when
+        the user references prior work; before a second attempt at a
+        failing env/setup/config fix (paste the LITERAL error string —
+        exact tokens beat paraphrases); before recommending a non-obvious
+        workaround; for a library/framework quirk, try
+        anchor_hint={"kind":"concept","name":<library>} first.
 
-        When to call:
-          - The user asks "where is X at?" / "what did we decide about Y?"
-          - Session start when the user references prior work.
-          - Before saying you don't know something project-specific.
-
-        Search PROACTIVELY (not just when the user asks) when:
-          - You hit an env / import / setup / config / dependency error and
-            are about to attempt a second fix. Paste the LITERAL error
-            string as the query — exact tokens beat paraphrases.
-          - The user asks to "get X working" / "set up X" / "run X
-            locally" for an existing project. Before starting, run
-            `list_memories(anchor_hint={"kind":"project","name":X},
-            kind="episode")` once to surface known gotchas without
-            needing the right query.
-          - You're about to recommend a non-obvious workaround. Check
-            whether a solution memory already covers it.
-          - You hit a question you'd otherwise paste into a search engine
-            (a library quirk, a framework gotcha, a "why doesn't X work"
-            question). Try anchor_hint with kind="concept" first — the
-            library/topic name is often the right scope, e.g.
-            anchor_hint={"kind":"concept","name":"kuzu"}.
-
-        Hygiene: if a hit names a specific file, function, or flag,
-        VERIFY it still exists (grep, read) before recommending. Memory
-        can outlive the code it references.
-
-        Phrasing tip: noun phrases beat questions. "auth service location"
-        beats "where is the auth service". For solution lookups, paste
-        the verbatim error message — that's what the writer was supposed
-        to lead with.
+        Hygiene: if a hit names a specific file, function, or flag, VERIFY
+        it still exists before recommending — memory can outlive the code
+        it references.
 
         Args:
-          query: free-text. Embedded; ranked by vector distance.
-          anchor_hint: scope the search to memory anchored to a specific
-            graph node. Shapes:
-              {"kind":"project", "name":"knowitall"}
-                — our internal projects.
-              {"kind":"concept", "name":"kuzu"}
-                — public libraries, frameworks, or cross-cutting topics.
-            Resolves via the ANCHORED_TO graph, so a memory anchored to
-            multiple projects/concepts surfaces under each of them — this
-            is the idiom for shared/library knowledge (see `record`).
-            If the named node doesn't exist, returns [].
+          query: free-text. Embedded; ranked by vector distance. Noun
+            phrases beat questions ("auth service location" > "where is
+            the auth service").
+          anchor_hint: scope to memory anchored to a graph node, e.g.
+            {"kind":"project","name":"knowitall"} (internal projects) or
+            {"kind":"concept","name":"kuzu"} (libraries/frameworks/cross-
+            cutting topics). A memory anchored to several projects/
+            concepts surfaces under each (see `record`'s SCOPING doc). []
+            if the named node doesn't exist.
           project_hint: DEPRECATED alias for
-            anchor_hint={"kind":"project","name":<hint>}. Kept for
-            backwards compatibility. Passing both raises ValueError.
+            anchor_hint={"kind":"project","name":<hint>}. Passing both
+            raises ValueError.
           k: top-k hits to return (default 10).
-          expand_hops: 0 (default) skips neighbor expansion entirely; 1
-            includes outbound ANCHORED_TO targets. Values >1 are rejected
-            (the multi-hop walk was never implemented — set to 1 if you
-            want neighbors, or use `cypher` for deeper traversal).
-          include_retracted: default False; pass True to include soft-deleted
-            entries.
-          node_types: filter by node_type list, e.g. ["decision","task"].
-            Allowed values: "decision","task","idea","note","episode".
-            This does NOT reach the Episode sub-kind (summary/blocker/
-            fact/solution) — all four share node_type="episode", so there
-            is no ranked way to search "just solutions". If you need that,
-            drop to `cypher`: `MATCH (e:Episode {kind:'solution'}) RETURN
-            e.id, e.body` (structural, not semantic — no ranking/score).
-          snippet_chars: 240 (default) truncates each hit's text to that
-            many chars with a trailing ellipsis. Pass 0 for full bodies
-            (use `get_memory(id)` for a single full body without a query).
+          expand_hops: 0 (default) skips neighbor expansion; 1 includes
+            outbound ANCHORED_TO targets. >1 rejected — use `cypher` for
+            deeper traversal.
+          include_retracted: default False; pass True to include soft-
+            deleted entries.
+          node_types: filter by node_type, e.g. ["decision","task"].
+            Allowed: "decision","task","idea","note","episode". Does NOT
+            reach the Episode sub-kind (summary/blocker/fact/solution —
+            all share node_type="episode"); for "just solutions" drop to
+            `cypher`: `MATCH (e:Episode {kind:'solution'}) RETURN e.id,
+            e.body` (structural, no ranking/score).
+          snippet_chars: 240 (default) truncates text with a trailing
+            ellipsis. 0 for full bodies (or use `get_memory(id)` directly).
 
         Returns: [{"hit": {id,text,kind,node_type,project_id,score,created_at,
         retracted_at}, "neighbors": [{label, ...identifying fields}]}].
