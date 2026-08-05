@@ -6,7 +6,7 @@ Usage:
         --body "Use Kuzu over Neo4j" --project knowitall \\
         --anchor '{"kind":"file","repo":"knowitall","path":"PLAN.md"}'
     uv run python -m client.cli query "graph database choice" --project knowitall
-    uv run python -m client.cli forget <id> --reason "duplicate"
+    uv run python -m client.cli amend <id> --retract --reason "duplicate"
     uv run python -m client.cli update-todo <id> --status done \\
         --anchor '{"kind":"commit","sha":"abc1234","repo":"knowitall"}'
     uv run python -m client.cli cypher "MATCH (p:Project) RETURN p.name"
@@ -90,9 +90,15 @@ def main() -> None:
     q.add_argument("--node-type", action="append", default=None,
                    help="filter by node_type; repeatable")
 
-    f = sub.add_parser("forget")
-    f.add_argument("id")
-    f.add_argument("--reason", required=True)
+    a = sub.add_parser("amend")
+    a.add_argument("id")
+    a.add_argument("--body", default=None)
+    a.add_argument("--summary", default=None)
+    a.add_argument("--anchor", action="append", default=[],
+                   help="JSON anchor object to add; repeatable")
+    a.add_argument("--retract", action="store_true", help="soft-delete this memory")
+    a.add_argument("--unretract", action="store_true", help="un-retract this memory")
+    a.add_argument("--reason", default=None, help="only valid with --retract")
 
     u = sub.add_parser("update-todo")
     u.add_argument("id")
@@ -130,8 +136,24 @@ def main() -> None:
         if args.node_type:
             payload["node_types"] = args.node_type
         asyncio.run(_call("query_memory", payload))
-    elif args.cmd == "forget":
-        asyncio.run(_call("forget", {"id": args.id, "reason": args.reason}))
+    elif args.cmd == "amend":
+        if args.retract and args.unretract:
+            raise SystemExit("--retract and --unretract are mutually exclusive")
+        payload = {"id": args.id}
+        if args.body is not None:
+            payload["body"] = args.body
+        if args.summary is not None:
+            payload["summary"] = args.summary
+        anchors = _parse_anchors(args.anchor)
+        if anchors:
+            payload["add_anchors"] = anchors
+        if args.retract:
+            payload["retract"] = True
+        elif args.unretract:
+            payload["retract"] = False
+        if args.reason is not None:
+            payload["reason"] = args.reason
+        asyncio.run(_call("amend", payload))
     elif args.cmd == "update-todo":
         payload = {"id": args.id, "status": args.status}
         anchors = _parse_anchors(args.anchor)

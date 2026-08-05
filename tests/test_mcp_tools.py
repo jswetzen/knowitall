@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -323,17 +325,17 @@ async def test_node_types_filter(tools, fake_embed):
     assert [r["hit"]["node_type"] for r in eps] == ["episode"]
 
 
-# ----------------- forget / retracted_at -----------------
+# ----------------- amend(retract=...) / retracted_at -----------------
 
 
-async def test_forget_hides_from_default_query(tools, fake_embed):
+async def test_amend_retract_hides_from_default_query(tools, fake_embed):
     fns, _ = tools
     stored = await fns["record"](
         kind="note", body="to forget", project_hint="px"
     )
-    out = await fns["forget"](id=stored["id"], reason="dup")
-    assert out["label"] == "Note"
+    out = await fns["amend"](id=stored["id"], retract=True, reason="dup")
     assert out["retracted_at"]
+    assert out["retract_reason"] == "dup"
 
     rows = await fns["query_memory"](query="x", project_hint="px")
     assert rows == []
@@ -344,11 +346,43 @@ async def test_forget_hides_from_default_query(tools, fake_embed):
     assert len(rows) == 1
     assert rows[0]["hit"]["retracted_at"] is not None
 
+    # reason is actually persisted (forget() used to accept-and-discard it).
+    reason_rows = await fns["cypher"](
+        "MATCH (n:Note {id: $id}) RETURN n.retract_reason", {"id": stored["id"]}
+    )
+    assert reason_rows == [["dup"]]
 
-async def test_forget_unknown_id_raises(tools):
+
+async def test_amend_retract_unknown_id_raises(tools):
     fns, _ = tools
-    with pytest.raises(ValueError, match="no retractable node"):
-        await fns["forget"](id="nope", reason="r")
+    with pytest.raises(ValueError, match="no memory node"):
+        await fns["amend"](id="nope", retract=True, reason="r")
+
+
+async def test_amend_reason_without_retract_raises(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="only meaningful together with retract=True"):
+        await fns["amend"](id=out["id"], body="y", reason="not retracting")
+
+
+async def test_amend_unretract_restores_editability(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="original")
+    await fns["amend"](id=out["id"], retract=True, reason="oops")
+
+    # Retracted: any other edit is rejected...
+    with pytest.raises(ValueError, match="cannot amend retracted"):
+        await fns["amend"](id=out["id"], body="nope")
+
+    # ...unless the same call un-retracts, optionally combined with a fix.
+    res = await fns["amend"](id=out["id"], retract=False, body="corrected")
+    assert res["retracted_at"] is None
+    assert res["retract_reason"] is None
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["retracted_at"] is None
+    assert got["body"] == "corrected"
 
 
 # ----------------- update_todo -----------------
@@ -379,6 +413,23 @@ async def test_update_todo_non_done_status(tools, fake_embed):
     )
     assert rows[0][0] == "in_progress"
     assert rows[0][1] is None
+
+
+async def test_update_todo_bumps_amended_at(tools, fake_embed):
+    # Regression: status transitions used to leave amended_at NULL forever,
+    # so a date-window query couldn't tell a task's status had changed.
+    fns, _ = tools
+    stored = await fns["record"](kind="task", body="ship thing")
+    rows = await fns["cypher"](
+        "MATCH (t:Task {id: $id}) RETURN t.amended_at", {"id": stored["id"]}
+    )
+    assert rows[0][0] is None
+
+    await fns["update_todo"](id=stored["id"], status="in_progress")
+    rows = await fns["cypher"](
+        "MATCH (t:Task {id: $id}) RETURN t.amended_at", {"id": stored["id"]}
+    )
+    assert rows[0][0] is not None
 
 
 async def test_update_todo_with_commit_creates_closed_by(tools, fake_embed):
@@ -566,7 +617,7 @@ async def test_list_memories_unknown_kind_raises(tools):
 async def test_list_memories_hides_retracted_by_default(tools, fake_embed):
     fns, _ = tools
     stored = await fns["record"](kind="idea", body="goner", project_hint="lp")
-    await fns["forget"](id=stored["id"], reason="x")
+    await fns["amend"](id=stored["id"], retract=True, reason="x")
     rows = await fns["list_memories"](kind="idea", project_hint="lp")
     assert rows == []
     rows = await fns["list_memories"](
@@ -604,6 +655,108 @@ async def test_list_memories_includes_project_id_without_filter(tools, fake_embe
     assert rows[0]["project_id"] == out["project_id"]
 
 
+# ----------------- list_memories since/until -----------------
+
+
+async def test_list_memories_since_excludes_older_rows(tools, fake_embed):
+    fns, state = tools
+    old = await fns["record"](kind="idea", body="old idea", project_hint="dw")
+    conn = state.kuzu_conn()
+    long_ago = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    conn.execute(
+        "MATCH (i:Idea {id: $id}) SET i.created_at = $t",
+        {"id": old["id"], "t": long_ago},
+    )
+    recent = await fns["record"](kind="idea", body="recent idea", project_hint="dw")
+
+    rows = await fns["list_memories"](
+        project_hint="dw", since="2026-01-01T00:00:00+00:00"
+    )
+    ids = {r["id"] for r in rows}
+    assert ids == {recent["id"]}
+
+
+async def test_list_memories_since_matches_on_amended_at_too(tools, fake_embed):
+    # "What did I work on this week?" must catch an old memory revised
+    # recently, not just memories created recently.
+    fns, state = tools
+    old = await fns["record"](kind="decision", body="old decision", project_hint="dw2")
+    conn = state.kuzu_conn()
+    long_ago = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    conn.execute(
+        "MATCH (d:Decision {id: $id}) SET d.decided_at = $t",
+        {"id": old["id"], "t": long_ago},
+    )
+    # Not amended yet — falls outside the window on both timestamps.
+    rows = await fns["list_memories"](
+        project_hint="dw2", since="2026-01-01T00:00:00+00:00"
+    )
+    assert rows == []
+
+    await fns["amend"](id=old["id"], summary="touched this week")
+    rows = await fns["list_memories"](
+        project_hint="dw2", since="2026-01-01T00:00:00+00:00"
+    )
+    assert {r["id"] for r in rows} == {old["id"]}
+
+
+async def test_list_memories_until_excludes_newer_rows(tools, fake_embed):
+    fns, state = tools
+    old = await fns["record"](kind="idea", body="old idea", project_hint="dw3")
+    conn = state.kuzu_conn()
+    long_ago = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    conn.execute(
+        "MATCH (i:Idea {id: $id}) SET i.created_at = $t",
+        {"id": old["id"], "t": long_ago},
+    )
+    await fns["record"](kind="idea", body="recent idea", project_hint="dw3")
+
+    rows = await fns["list_memories"](
+        project_hint="dw3", until="2020-06-01T00:00:00+00:00"
+    )
+    assert {r["id"] for r in rows} == {old["id"]}
+
+
+async def test_list_memories_since_after_until_raises(tools):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="is after"):
+        await fns["list_memories"](
+            since="2026-06-01T00:00:00+00:00", until="2026-01-01T00:00:00+00:00"
+        )
+
+
+async def test_list_memories_bad_date_raises(tools):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="not a valid ISO-8601"):
+        await fns["list_memories"](since="not-a-date")
+
+
+# ----------------- query_memory since/until -----------------
+
+
+async def test_query_memory_since_filters_by_lance_created_at(tools, fake_embed):
+    from server.mcp_tools import _insert_embedding_row
+
+    fns, state = tools
+    recent = await fns["record"](kind="idea", body="recent idea", project_hint="qdw")
+
+    # Simulate a pre-existing old Lance row (bypassing record()'s _now()).
+    old_id = str(uuid4())
+    long_ago = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    vec = [0.01 * (i % 100) for i in range(768)]
+    _insert_embedding_row(
+        state, row_id=old_id, node_type="idea", text="old idea",
+        vec=vec, project_id=recent["project_id"], kind="idea",
+        created_at=long_ago,
+    )
+
+    rows = await fns["query_memory"](
+        query="idea", project_hint="qdw", since="2026-01-01T00:00:00+00:00"
+    )
+    ids = {r["hit"]["id"] for r in rows}
+    assert ids == {recent["id"]}
+
+
 # ----------------- get_memory -----------------
 
 
@@ -628,7 +781,7 @@ async def test_get_memory_unknown_id_returns_none(tools):
 async def test_get_memory_returns_retracted(tools, fake_embed):
     fns, _ = tools
     out = await fns["record"](kind="idea", body="i", project_hint="gp")
-    await fns["forget"](id=out["id"], reason="r")
+    await fns["amend"](id=out["id"], retract=True, reason="r")
     got = await fns["get_memory"](id=out["id"])
     assert got is not None
     assert got["retracted_at"] is not None
@@ -657,9 +810,6 @@ async def test_get_memory_note_recovers_full_body_from_lance_fallback(
     # body still exists (record() always embedded the full body, even for
     # notes). get_memory should recover it rather than only ever returning
     # the clipped title.
-    from datetime import datetime, timezone
-    from uuid import uuid4
-
     from server.mcp_tools import _create_graph_node, _insert_embedding_row
 
     fns, state = tools
@@ -689,9 +839,6 @@ async def test_get_memory_note_without_lance_row_returns_clipped_title(
     # If no Lance row survives for a legacy over-length note (e.g. it was
     # amended pre-fix and the row was deleted without a reinsert), get_memory
     # must degrade gracefully to the clipped graph title, not error out.
-    from datetime import datetime, timezone
-    from uuid import uuid4
-
     from server.mcp_tools import _create_graph_node
 
     fns, state = tools
@@ -925,7 +1072,7 @@ async def test_amend_summary_only_no_re_embed(tools, fake_embed):
 async def test_amend_rejects_retracted(tools, fake_embed):
     fns, _ = tools
     out = await fns["record"](kind="idea", body="x")
-    await fns["forget"](id=out["id"], reason="r")
+    await fns["amend"](id=out["id"], retract=True, reason="r")
     with pytest.raises(ValueError, match="cannot amend retracted"):
         await fns["amend"](id=out["id"], body="new")
 
@@ -1107,7 +1254,7 @@ async def test_efd_to_pfd_rename_via_supersedes(tools, fake_embed):
         project_hint="rp",
         relates_to=[{"kind": "supersedes", "id": efd["id"]}],
     )
-    await fns["forget"](id=efd["id"], reason="renamed to PFD")
+    await fns["amend"](id=efd["id"], retract=True, reason="renamed to PFD")
     # Edge persists across retraction; the graph still shows the lineage.
     rows = await fns["cypher"](
         "MATCH (newer:Idea {id: $nid})-[:SUPERSEDES_MEMORY]->(older:Idea) "

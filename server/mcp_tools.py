@@ -112,6 +112,49 @@ def _coerce(v: Any) -> Any:
     return v
 
 
+def _parse_iso_datetime(param_name: str, value: str | None) -> datetime | None:
+    """Parse an optional ISO-8601 string, raising a clear ValueError on
+    malformed input rather than letting `fromisoformat` raise inline."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(
+            f"{param_name} is not a valid ISO-8601 datetime: {value!r} ({e})"
+        )
+
+
+def _date_window_clause(
+    columns: list[str],
+    since: datetime | None,
+    until: datetime | None,
+    params: dict[str, Any],
+    prefix: str,
+) -> str:
+    """Kùzu Cypher fragment matching if ANY of `columns` falls in [since,
+    until] (either bound optional) — i.e. "touched" by any of several
+    timestamp columns (e.g. created_at OR amended_at), not just one.
+    Bound values are added to `params` under `{prefix}_since`/
+    `{prefix}_until`. Returns "" (no-op) if both bounds are None.
+    """
+    if since is None and until is None:
+        return ""
+    if since is not None:
+        params[f"{prefix}_since"] = since
+    if until is not None:
+        params[f"{prefix}_until"] = until
+    per_column = []
+    for col in columns:
+        bounds = []
+        if since is not None:
+            bounds.append(f"{col} >= ${prefix}_since")
+        if until is not None:
+            bounds.append(f"{col} <= ${prefix}_until")
+        per_column.append("(" + " AND ".join(bounds) + ")")
+    return "(" + " OR ".join(per_column) + ")"
+
+
 def _insert_embedding_row(
     state: AppState,
     *,
@@ -340,12 +383,18 @@ def _list_one_label(
     *,
     scope_ids: set[str] | None,
     include_retracted: bool,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Return raw rows for one memory label. Sort + slice happen in Python.
 
     scope_ids: if not None, restrict to nodes whose id is in this set. The
     caller (list_memories) resolves anchor_hint once into a single id set
     spanning every memory-bearing label. If None, list everything.
+
+    since/until: if given, keep only rows whose creation timestamp OR
+    amended_at falls in [since, until] — "touched" during the window, not
+    just created in it. Either bound may be omitted.
 
     project_id surfaced in the row is informational — it reads any Project
     anchor on the node via OPTIONAL MATCH. Memories anchored to multiple
@@ -359,6 +408,7 @@ def _list_one_label(
     node_type = "episode" if label == "Episode" else label.lower()
 
     clauses: list[str] = []
+    params: dict[str, Any] = {}
     if not include_retracted:
         clauses.append("n.retracted_at IS NULL")
     if scope_ids is not None:
@@ -366,6 +416,11 @@ def _list_one_label(
             return []
         quoted = ", ".join(f"'{i}'" for i in scope_ids)
         clauses.append(f"n.id IN [{quoted}]")
+    window_clause = _date_window_clause(
+        [f"n.{ts_field}", "n.amended_at"], since, until, params, "w"
+    )
+    if window_clause:
+        clauses.append(window_clause)
 
     summary_select = f"n.{summary_field}" if summary_field else f"n.{body_field}"
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -381,13 +436,13 @@ def _list_one_label(
         f"{match_clause} "
         f"RETURN n.id, n.{body_field} AS body_value, "
         f"{summary_select} AS stored_summary, n.{ts_field}, "
-        f"n.retracted_at, p.id AS pid"
+        f"n.retracted_at, n.amended_at, p.id AS pid"
     )
-    result = conn.execute(query, {})
+    result = conn.execute(query, params)
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     while result.has_next():
-        node_id, body_value, stored_summary, created_at, retracted_at, pid = (
+        node_id, body_value, stored_summary, created_at, retracted_at, amended_at, pid = (
             result.get_next()
         )
         # OPTIONAL MATCH yields duplicates when a node has multiple Project
@@ -402,6 +457,7 @@ def _list_one_label(
                 "summary": _effective_summary(label, stored_summary, body_value),
                 "project_id": pid,
                 "created_at": created_at,
+                "amended_at": amended_at,
                 "retracted_at": retracted_at,
             }
         )
@@ -710,7 +766,9 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         status: free-form, but conventional values are
           "open" | "in_progress" | "blocked" | "done" | "abandoned".
         When status=="done" and a commit anchor is provided, a CLOSED_BY edge
-        is also written from Task to Commit.
+        is also written from Task to Commit. Every call bumps `amended_at`,
+        so a date-window query (`list_memories`'s since/until) catches
+        status transitions, not just body/summary edits.
 
         Returns: {"id", "status", "anchored": [...]}.
         """
@@ -727,12 +785,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             raise ValueError(f"Task {id} is retracted")
 
         closed_at_clause = ", t.closed_at = $now" if status == "done" else ""
-        params = {"id": id, "s": status}
-        if closed_at_clause:
-            params["now"] = now
         conn.execute(
-            f"MATCH (t:Task {{id: $id}}) SET t.status = $s{closed_at_clause}",
-            params,
+            f"MATCH (t:Task {{id: $id}}) SET t.status = $s, "
+            f"t.amended_at = $now{closed_at_clause}",
+            {"id": id, "s": status, "now": now},
         )
 
         anchored = apply_anchors(conn, "Task", id, anchors or [], now)
@@ -760,63 +816,22 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         return {"id": id, "status": status, "anchored": anchored}
 
     @mcp.tool()
-    async def forget(id: str, reason: str) -> dict[str, Any]:
-        """Soft-delete a memory node: sets retracted_at; default queries hide it.
-
-        Write tool. Use when the user says a stored memory is wrong, obsolete,
-        or duplicate. The node and its edges remain in the graph; only the
-        `retracted_at` timestamp is set. `query_memory(..., include_retracted=
-        True)` will surface it again. There is no hard delete.
-
-        Args:
-          id: the node id returned by `record`.
-          reason: short string captured on the audit trail (currently
-                  embedded in the retraction; future versions may write a
-                  separate Retraction node).
-
-        Returns: {"id", "retracted_at": ISO timestamp, "label": <node label>}.
-        """
-        conn = state.kuzu_conn()
-        label = _lookup_node_label(conn, id)
-        if label is None:
-            raise ValueError(f"no retractable node with id={id}")
-        now = _now()
-        conn.execute(
-            f"MATCH (n:{label} {{id: $id}}) SET n.retracted_at = $now",
-            {"id": id, "now": now},
-        )
-        # Mirror onto the LanceDB row. LanceDB update API is `update(where=..., values=...)`.
-        try:
-            state.embeddings.update(
-                where=f"id = '{id}'",
-                values={"retracted_at": now},
-            )
-        except Exception:
-            # If the row isn't in embeddings (e.g. a kind that doesn't embed),
-            # the graph-side retraction is still authoritative.
-            pass
-        return {
-            "id": id,
-            "label": label,
-            "retracted_at": now.isoformat(),
-            "reason": reason,
-        }
-
-    @mcp.tool()
     async def amend(
         id: str,
         body: str | None = None,
         summary: str | None = None,
         add_anchors: list[dict[str, Any]] | None = None,
         remove_anchors: list[dict[str, Any]] | None = None,
+        retract: bool | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         """In-place edit of a memory node. Preserves id; re-embeds when body changes.
 
         Write tool. Use this when an existing memory needs to be revised —
-        a renamed concept, a sharpened decision, an updated task body.
-        Unlike `record`+`forget`, this keeps the id stable so anchors and
-        any inbound memory→memory edges (RELATES_TO_MEMORY, etc.) keep
-        pointing at the right thing.
+        a renamed concept, a sharpened decision, an updated task body — or
+        retracted. Unlike recording a replacement, this keeps the id stable
+        so anchors and any inbound memory→memory edges (RELATES_TO_MEMORY,
+        etc.) keep pointing at the right thing.
 
         Args:
           id: the node id returned by `record` / `list_memories`.
@@ -824,9 +839,9 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             old embedding row is deleted and a fresh one inserted, so
             subsequent `query_memory` calls reflect the new wording. For
             `kind="note"`, body must stay <=200 chars (a Note is
-            title-only) — a longer amended body is REJECTED; to keep
-            longer content, record a new "fact"/"idea"/"decision"/"task"
-            and `forget` the note instead of growing it past a title.
+            title-only) — a longer amended body is REJECTED; record a new
+            "fact"/"idea"/"decision"/"task" instead of growing a note
+            past a title.
           summary: if provided, replaces the stored summary. Pure graph
             SET — no re-embed (summary is not part of the embedded text).
             For `kind=note` the value writes to `title`. Validated against
@@ -837,21 +852,36 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
           remove_anchors: list of {"target_label", "target_id"} pairs
             (the shape returned in `record(...)["anchored"]`) to detach.
             Only the ANCHORED_TO edge is removed; the target node stays.
-
-        Retracted nodes are rejected — to revise a retracted memory,
-        either record a new one or un-retract via direct cypher (not yet
-        a typed mutation).
+          retract: True soft-deletes (sets retracted_at; default queries
+            hide it; `query_memory(..., include_retracted=True)` surfaces
+            it again). False un-retracts. Composable with body/summary/
+            anchors in the SAME call — e.g. un-retract and correct at
+            once: `amend(id, retract=False, body="corrected text")`. A
+            retracted node rejects every OTHER kind of edit (body/summary/
+            anchors) unless this same call also passes retract=False.
+          reason: short string persisted alongside a retraction (only
+            meaningful together with retract=True — passing it otherwise
+            raises ValueError rather than silently dropping it).
 
         Returns: {"id", "node_type", "amended_at", "re_embedded": bool,
-        "added": [...], "removed": [...]}.
+        "added": [...], "removed": [...], "retracted_at", "retract_reason"}.
         """
         if summary is not None and len(summary) > SUMMARY_MAX_LEN:
             raise ValueError(
                 f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})."
             )
-        if body is None and summary is None and not add_anchors and not remove_anchors:
+        if reason is not None and not retract:
             raise ValueError(
-                "amend requires at least one of body / summary / add_anchors / remove_anchors"
+                "reason is only meaningful together with retract=True "
+                f"(got retract={retract!r})"
+            )
+        if (
+            body is None and summary is None and not add_anchors
+            and not remove_anchors and retract is None
+        ):
+            raise ValueError(
+                "amend requires at least one of body / summary / add_anchors "
+                "/ remove_anchors / retract"
             )
 
         conn = state.kuzu_conn()
@@ -859,13 +889,21 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         if label is None:
             raise ValueError(f"no memory node with id={id}")
 
-        # Reject retracted: addressable (get_memory still works) but not editable.
+        # Retracted nodes reject every edit except un-retracting (retract=
+        # False) — addressable via get_memory either way, but not silently
+        # editable while retracted.
         retracted_check = conn.execute(
             f"MATCH (n:{label} {{id: $id}}) RETURN n.retracted_at LIMIT 1",
             {"id": id},
         )
-        if retracted_check.has_next() and retracted_check.get_next()[0] is not None:
-            raise ValueError(f"cannot amend retracted node {id}")
+        is_retracted = (
+            retracted_check.has_next() and retracted_check.get_next()[0] is not None
+        )
+        if is_retracted and retract is not False:
+            raise ValueError(
+                f"cannot amend retracted node {id} — pass retract=False in "
+                "this same call to un-retract it first, or a separate call."
+            )
 
         now = _now()
         fields = _LIST_FIELDS[label]
@@ -880,8 +918,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                     f"amended note body is {len(body)} chars but a Note "
                     f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
                     "longer content, record a new kind=\"fact\"/\"idea\"/"
-                    "\"decision\"/\"task\" and forget this note; don't "
-                    "grow a note past a title."
+                    "\"decision\"/\"task\" instead; don't grow a note past "
+                    "a title."
                 )
             # Note's body lives in `title`, clipped at SUMMARY_MAX_LEN — a
             # no-op now that the length is validated above.
@@ -976,6 +1014,31 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 )
                 removed.append({"target_label": target_label, "target_id": target_id})
 
+        if retract is not None:
+            if retract:
+                conn.execute(
+                    f"MATCH (n:{label} {{id: $id}}) SET n.retracted_at = $now, "
+                    f"n.retract_reason = $reason",
+                    {"id": id, "now": now, "reason": reason},
+                )
+                lance_retracted_at: datetime | None = now
+            else:
+                conn.execute(
+                    f"MATCH (n:{label} {{id: $id}}) SET n.retracted_at = NULL, "
+                    f"n.retract_reason = NULL",
+                    {"id": id},
+                )
+                lance_retracted_at = None
+            # Mirror onto the LanceDB row. Harmless no-op if no row exists
+            # (e.g. a kind that doesn't embed, or a prior amend deleted it).
+            try:
+                state.embeddings.update(
+                    where=f"id = '{id}'",
+                    values={"retracted_at": lance_retracted_at},
+                )
+            except Exception:
+                pass
+
         conn.execute(
             f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now",
             {"id": id, "now": now},
@@ -988,6 +1051,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "re_embedded": re_embedded,
             "added": added,
             "removed": removed,
+            "retracted_at": now.isoformat() if retract else None,
+            "retract_reason": reason if retract else None,
         }
 
     @mcp.tool()
@@ -1000,6 +1065,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         include_retracted: bool = False,
         node_types: list[str] | None = None,
         snippet_chars: int = 240,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic search over recorded memory; optional 1-hop graph expansion.
 
@@ -1046,6 +1113,14 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             e.body` (structural, no ranking/score).
           snippet_chars: 240 (default) truncates text with a trailing
             ellipsis. 0 for full bodies (or use `get_memory(id)` directly).
+          since / until: optional ISO-8601 bounds (either may be omitted)
+            on the embedding row's `created_at` — which is the LAST
+            (re-)embed time, not necessarily the original record time,
+            since `amend(body=...)` re-embeds in place. For a pure
+            enumeration window ("what did I work on this week") prefer
+            `list_memories(since=..., until=...)`, which checks the
+            graph's real created_at OR amended_at; this is the semantic-
+            search equivalent when you also need a query.
 
         Returns: [{"hit": {id,text,kind,node_type,project_id,score,created_at,
         retracted_at}, "neighbors": [{label, ...identifying fields}]}].
@@ -1056,12 +1131,17 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                 f"expand_hops must be 0 or 1, got {expand_hops}. "
                 "Multi-hop traversal is not implemented; use cypher for it."
             )
+        since_dt = _parse_iso_datetime("since", since)
+        until_dt = _parse_iso_datetime("until", until)
+        if since_dt is not None and until_dt is not None and since_dt > until_dt:
+            raise ValueError(f"since ({since}) is after until ({until})")
         with profile("query_memory") as p:
             with p.stage("embed"):
                 vec = await embed(state.http, query)
             return _query_memory_search(
                 state, p, vec, k, expand_hops, snippet_chars,
                 project_hint, anchor_hint, node_types, include_retracted,
+                since_dt, until_dt,
             )
 
     def _query_memory_search(
@@ -1075,6 +1155,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         anchor_hint: dict[str, Any] | None,
         node_types: list[str] | None,
         include_retracted: bool,
+        since: datetime | None = None,
+        until: datetime | None = None,
     ) -> list[dict[str, Any]]:
         conn = state.kuzu_conn()
 
@@ -1093,6 +1175,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         if node_types:
             quoted = ", ".join(f"'{nt}'" for nt in node_types)
             clauses.append(f"node_type IN ({quoted})")
+        if since is not None:
+            clauses.append(f"created_at >= timestamp '{since.isoformat()}'")
+        if until is not None:
+            clauses.append(f"created_at <= timestamp '{until.isoformat()}'")
 
         with p.stage("lance"):
             search = state.embeddings.search(vec).limit(k)
@@ -1152,8 +1238,9 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         `query_memory` for free-text semantic recall.
 
         Nodes (memory-bearing): Episode, Decision, Task, Idea, Note.
-          All carry: id, retracted_at, amended_at. Decision/Task/Idea/
-          Episode also have a `summary` column; Note uses `title`.
+          All carry: id, retracted_at, retract_reason, amended_at.
+          Decision/Task/Idea/Episode also have a `summary` column; Note
+          uses `title`.
         Nodes (anchor targets): Project, Commit, File, Symbol, Concept,
           Person, Repo.
 
@@ -1178,7 +1265,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         Mutating keywords (CREATE/MERGE/DELETE/SET/DROP/REMOVE/DETACH/COPY/
         ALTER/INSTALL/LOAD/ATTACH/CALL) are rejected. Writes go through
-        `record`, `amend`, `update_todo`, or `forget`.
+        `record`, `amend` (also handles retract/un-retract), or
+        `update_todo`.
 
         Example: `MATCH (d:Decision)-[:ANCHORED_TO]->(f:File)
                   RETURN d.body, f.path`.
@@ -1207,13 +1295,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         offset: int = 0,
         order_by: str = "created_at_desc",
         include_retracted: bool = False,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         """Enumerate memory nodes without semantic ranking. Returns summaries.
 
         Read tool (enumeration). The third navigation primitive alongside
         `query_memory` (semantic) and `cypher` (structural). Use when you
         want to see *what's in here* without a query in mind — e.g. "what
-        ideas do I have on project X?", "what tasks are open?".
+        ideas do I have on project X?", "what tasks are open?", "what did
+        I work on this week?" (since="2026-07-29").
 
         Bodies are NOT returned. Each row carries a `summary` (first ~200
         chars of body, or for Note the existing title). Use `get_memory`
@@ -1240,9 +1331,15 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
           order_by: "created_at_desc" (default) | "created_at_asc".
           include_retracted: default False; pass True to include
             soft-deleted entries.
+          since / until: optional ISO-8601 bounds (either may be omitted).
+            Keeps a memory if its creation time OR `amended_at` falls in
+            [since, until] — i.e. "touched" during the window, not just
+            created in it, so an old Decision you revised this week still
+            shows up. `update_todo` also bumps `amended_at`, so a status
+            transition counts as "touched" too.
 
         Returns: [{id, node_type, summary, project_id, created_at,
-        retracted_at}]. created_at/retracted_at are ISO strings or None.
+        amended_at, retracted_at}]. Timestamps are ISO strings or None.
         """
         if kind is not None and kind not in MEMORY_KIND_TO_LABEL:
             raise ValueError(
@@ -1252,6 +1349,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             raise ValueError(
                 f"unknown order_by '{order_by}'. Allowed: created_at_desc | created_at_asc"
             )
+        since_dt = _parse_iso_datetime("since", since)
+        until_dt = _parse_iso_datetime("until", until)
+        if since_dt is not None and until_dt is not None and since_dt > until_dt:
+            raise ValueError(f"since ({since}) is after until ({until})")
 
         conn = state.kuzu_conn()
 
@@ -1281,6 +1382,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
                             label,
                             scope_ids=scope_ids,
                             include_retracted=include_retracted,
+                            since=since_dt,
+                            until=until_dt,
                         )
                     )
 
@@ -1302,6 +1405,9 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         for row in sliced:
             row["created_at"] = (
                 row["created_at"].isoformat() if row["created_at"] is not None else None
+            )
+            row["amended_at"] = (
+                row["amended_at"].isoformat() if row["amended_at"] is not None else None
             )
             row["retracted_at"] = (
                 row["retracted_at"].isoformat()

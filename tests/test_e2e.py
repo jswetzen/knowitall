@@ -73,7 +73,7 @@ async def test_store_query_via_mcp_client(live_server):
                 "record",
                 "query_memory",
                 "cypher",
-                "forget",
+                "amend",
                 "update_todo",
             } <= tool_names
 

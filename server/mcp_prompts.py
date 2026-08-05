@@ -1,7 +1,7 @@
 """MCP prompts surfaced to Claude Code as /knowitall:*.
 
 These return user-role messages that instruct Claude what to do next using
-the `record`, `update_todo`, `forget`, `query_memory`, `cypher` tools. The
+the `record`, `update_todo`, `amend`, `query_memory`, `cypher` tools. The
 server does not actually execute the work — it ships a templated playbook
 that Claude runs.
 """
@@ -36,7 +36,7 @@ def register_prompts(mcp: FastMCP, state: AppState) -> None:
             "for recent commits (out-of-band; not in the graph unless ingested).\n"
             "5. Emit a markdown digest with sections: Recent decisions · Open "
             "tasks · Recent episodes · Recent commits. Cite ids so the user "
-            "can `forget` or `update_todo` them."
+            "can `amend` (retract) or `update_todo` them."
         )
 
     @mcp.prompt(

@@ -126,7 +126,7 @@ DDL lives in `schema/v1.cypher`. Migrations are forward-only files applied in or
 | `Concept` | A free-form topic | `id, name` |
 | `Person` | Git author / mentioned human | `id, name, email` |
 | `Task` | A todo | `id, body, status, created_at, closed_at` — status is free-form/unenforced; the conventional set has grown since week 1 (see `update_todo`'s docstring: `open\|in_progress\|blocked\|done\|abandoned`, not the `open/done/dropped` originally planned here) |
-| `Idea` | Embryonic project idea | ~~`id, body, status (incubating/graduated/dropped), created_at, died_at`~~ **SUPERSEDED (v4):** `id, body, created_at, retracted_at, amended_at, summary`. `status`/`died_at` were dropped (`schema/v4.cypher`) — the lifecycle enum was written once as `'open'` at creation and never had a transition tool, so `GRADUATED_TO`/`DROPPED` never fired. Retiring an idea is `forget()`; a graduation, if it ever happens, is a `relates_to` edge, not a status flip. |
+| `Idea` | Embryonic project idea | ~~`id, body, status (incubating/graduated/dropped), created_at, died_at`~~ **SUPERSEDED (v4):** `id, body, created_at, retracted_at, retract_reason, amended_at, summary`. `status`/`died_at` were dropped (`schema/v4.cypher`) — the lifecycle enum was written once as `'open'` at creation and never had a transition tool, so `GRADUATED_TO`/`DROPPED` never fired. Retiring an idea is `amend(id, retract=True)` (v5, `schema/v5.cypher` — folded the old standalone `forget` tool in); a graduation, if it ever happens, is a `relates_to` edge, not a status flip. |
 
 ### Edge types (~18), all bi-temporal
 
