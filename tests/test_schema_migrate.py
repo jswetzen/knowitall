@@ -212,6 +212,49 @@ def test_v3_upgrade_then_new_columns_usable(staged_schema_dir, tmp_path):
     assert old_summary is None  # legacy row, NULL in the new column
 
 
+def test_v4_drops_idea_status_and_died_at(staged_schema_dir, tmp_path):
+    """v4 retires Idea.status/died_at — written once as 'open' at creation
+    and never transitioned by any tool. Confirm the columns are gone and
+    the rest of a legacy Idea row (created under v0-v3) survives."""
+    _stage_schemas(staged_schema_dir, [0, 1, 2, 3])
+    db_path = tmp_path / "kuzu"
+    db = kuzu.Database(str(db_path))
+    applied = migrate_module.apply_migrations(db)
+    assert applied == [0, 1, 2, 3]
+
+    conn = kuzu.Connection(db)
+    legacy_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "CREATE (:Idea {id: $id, body: 'legacy idea', status: 'open', "
+        "created_at: $t, died_at: NULL, retracted_at: NULL, summary: NULL, "
+        "amended_at: NULL})",
+        {"id": legacy_id, "t": now},
+    )
+    del conn
+
+    _stage_schemas(staged_schema_dir, [4])
+    applied = migrate_module.apply_migrations(db)
+    assert applied == [4]
+
+    conn = kuzu.Connection(db)
+    result = conn.execute(
+        "MATCH (i:Idea {id: $id}) RETURN i.body, i.created_at, i.retracted_at",
+        {"id": legacy_id},
+    )
+    assert result.has_next()
+    body, created_at, retracted_at = result.get_next()
+    assert body == "legacy idea"
+    assert created_at is not None
+    assert retracted_at is None
+
+    # status/died_at no longer exist as columns.
+    with pytest.raises(RuntimeError, match="status"):
+        conn.execute("MATCH (i:Idea {id: $id}) RETURN i.status", {"id": legacy_id})
+    with pytest.raises(RuntimeError, match="died_at"):
+        conn.execute("MATCH (i:Idea {id: $id}) RETURN i.died_at", {"id": legacy_id})
+
+
 def test_v3_upgrade_then_record_amend_via_mcp(
     staged_schema_dir, tmp_path, monkeypatch
 ):

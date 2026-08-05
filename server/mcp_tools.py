@@ -187,8 +187,8 @@ def _create_graph_node(
         )
     elif label == "Idea":
         conn.execute(
-            "CREATE (:Idea {id: $id, body: $b, status: 'open', created_at: $ts, "
-            "died_at: NULL, retracted_at: NULL, amended_at: NULL, summary: $s})",
+            "CREATE (:Idea {id: $id, body: $b, created_at: $ts, "
+            "retracted_at: NULL, amended_at: NULL, summary: $s})",
             {"id": node_id, "b": body, "ts": created_at, "s": summary},
         )
     elif label == "Note":
@@ -1106,6 +1106,11 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             entries.
           node_types: filter by node_type list, e.g. ["decision","task"].
             Allowed values: "decision","task","idea","note","episode".
+            This does NOT reach the Episode sub-kind (summary/blocker/
+            fact/solution) — all four share node_type="episode", so there
+            is no ranked way to search "just solutions". If you need that,
+            drop to `cypher`: `MATCH (e:Episode {kind:'solution'}) RETURN
+            e.id, e.body` (structural, not semantic — no ranking/score).
           snippet_chars: 240 (default) truncates each hit's text to that
             many chars with a trailing ellipsis. Pass 0 for full bodies
             (use `get_memory(id)` for a single full body without a query).

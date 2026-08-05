@@ -86,6 +86,17 @@ async def test_record_rejects_unknown_kind(tools, fake_embed):
         await fns["record"](kind="garbage", body="x")
 
 
+async def test_record_idea_has_no_status_or_died_at_columns(tools, fake_embed):
+    # v4 dropped Idea.status/died_at (write-only, never transitioned).
+    fns, state = tools
+    out = await fns["record"](kind="idea", body="an idea")
+    conn = state.kuzu_conn()
+    with pytest.raises(RuntimeError):
+        conn.execute(
+            "MATCH (i:Idea {id: $id}) RETURN i.status", {"id": out["id"]}
+        )
+
+
 async def test_record_with_file_anchor_creates_link(tools, fake_embed):
     fns, _ = tools
     out = await fns["record"](
