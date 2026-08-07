@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "mcp>=1.2",
+    "mcp>=1.2,<2.0",
     "kuzu>=0.7",
     "lancedb>=0.15",
     "pyarrow>=18",
