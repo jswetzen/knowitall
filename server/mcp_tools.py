@@ -926,29 +926,30 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             once: `amend(id, retract=False, body="corrected text")`. A
             retracted node rejects every OTHER kind of edit (body/summary/
             anchors) unless this same call also passes retract=False.
-          reason: short string persisted alongside a retraction (only
-            meaningful together with retract=True — passing it otherwise
-            raises ValueError rather than silently dropping it).
+          reason: short string explaining why this call happened. With
+            retract=True it persists to `retract_reason`; on any other
+            amend it persists to `amend_reason`, next to the `amended_at`
+            it explains. Most useful on a correcting amend ("this reverses
+            an earlier correction that was itself wrong") — that's the one
+            thing a diff of the body can't tell you later. Both fields are
+            last-write-wins: they describe the most recent change, not a
+            revision history.
 
         Returns: {"id", "node_type", "amended_at", "re_embedded": bool,
-        "added": [...], "removed": [...], "retracted_at", "retract_reason"}.
+        "added": [...], "removed": [...], "retracted_at", "retract_reason",
+        "amend_reason"}.
         """
         if summary is not None and len(summary) > SUMMARY_MAX_LEN:
             raise ValueError(
                 f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})."
             )
-        if reason is not None and not retract:
-            raise ValueError(
-                "reason is only meaningful together with retract=True "
-                f"(got retract={retract!r})"
-            )
         if (
             body is None and summary is None and not add_anchors
-            and not remove_anchors and retract is None
+            and not remove_anchors and retract is None and reason is None
         ):
             raise ValueError(
                 "amend requires at least one of body / summary / add_anchors "
-                "/ remove_anchors / retract"
+                "/ remove_anchors / retract / reason"
             )
 
         conn = state.kuzu_conn()
@@ -1108,9 +1109,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             except Exception:
                 pass
 
+        # `reason` explains whichever operation this call actually is: a
+        # retraction routes it to retract_reason (set above), anything else
+        # to amend_reason, alongside the amended_at it explains.
+        amend_reason = reason if not retract else None
         conn.execute(
-            f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now",
-            {"id": id, "now": now},
+            f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now"
+            + (", n.amend_reason = $reason" if amend_reason is not None else ""),
+            {"id": id, "now": now, "reason": amend_reason}
+            if amend_reason is not None
+            else {"id": id, "now": now},
         )
 
         return {
@@ -1122,6 +1130,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "removed": removed,
             "retracted_at": now.isoformat() if retract else None,
             "retract_reason": reason if retract else None,
+            "amend_reason": amend_reason,
         }
 
     @mcp.tool()
@@ -1507,7 +1516,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             neighbors (same shape as `query_memory` neighbors).
 
         Returns: {id, node_type, body, summary, project_id, created_at,
-        retracted_at, neighbors?} or None if no memory has that id.
+        retracted_at, retract_reason, amended_at, amend_reason, neighbors?}
+        or None if no memory has that id.
         """
         conn = state.kuzu_conn()
         resolved = _resolve_node_id(conn, id)
@@ -1529,14 +1539,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project) "
             f"RETURN n.{body_field} AS body_value, "
             f"{summary_select} AS stored_summary, n.{ts_field}, "
-            f"n.retracted_at, p.id LIMIT 1",
+            f"n.retracted_at, n.retract_reason, n.amended_at, "
+            f"n.amend_reason, p.id LIMIT 1",
             {"id": id},
         )
         if not result.has_next():
             return None
-        body_value, stored_summary, created_at, retracted_at, project_id = (
-            result.get_next()
-        )
+        (
+            body_value, stored_summary, created_at, retracted_at,
+            retract_reason, amended_at, amend_reason, project_id,
+        ) = result.get_next()
 
         out: dict[str, Any] = {
             "id": id,
@@ -1548,6 +1560,14 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "retracted_at": (
                 retracted_at.isoformat() if retracted_at is not None else None
             ),
+            "retract_reason": retract_reason,
+            # Paired: amended_at says when the last edit landed, amend_reason
+            # says why. Without both, a date-window list_memories hit is a
+            # timestamp with no story attached.
+            "amended_at": (
+                amended_at.isoformat() if amended_at is not None else None
+            ),
+            "amend_reason": amend_reason,
         }
         if label == "Note" and body_value is not None and len(body_value) >= SUMMARY_MAX_LEN:
             # Legacy over-length note (recorded/amended before the

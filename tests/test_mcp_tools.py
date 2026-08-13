@@ -359,11 +359,53 @@ async def test_amend_retract_unknown_id_raises(tools):
         await fns["amend"](id="nope", retract=True, reason="r")
 
 
-async def test_amend_reason_without_retract_raises(tools, fake_embed):
+async def test_amend_reason_without_retract_persists_as_amend_reason(
+    tools, fake_embed
+):
+    """A correcting amend is where `reason` is worth most — it used to raise."""
     fns, _ = tools
     out = await fns["record"](kind="idea", body="x")
-    with pytest.raises(ValueError, match="only meaningful together with retract=True"):
-        await fns["amend"](id=out["id"], body="y", reason="not retracting")
+    res = await fns["amend"](
+        id=out["id"], body="y", reason="reverses an earlier wrong correction"
+    )
+    assert res["amend_reason"] == "reverses an earlier wrong correction"
+    assert res["retract_reason"] is None
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["body"] == "y"
+    assert got["amend_reason"] == "reverses an earlier wrong correction"
+    assert got["amended_at"] is not None
+
+
+async def test_amend_reason_routes_to_retract_reason_when_retracting(
+    tools, fake_embed
+):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    res = await fns["amend"](id=out["id"], retract=True, reason="dup")
+    assert res["retract_reason"] == "dup"
+    assert res["amend_reason"] is None
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["retract_reason"] == "dup"
+    assert got["amend_reason"] is None
+
+
+async def test_amend_reason_alone_is_a_valid_edit(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    res = await fns["amend"](id=out["id"], reason="annotating why, no content change")
+    assert res["amend_reason"] == "annotating why, no content change"
+    assert res["re_embedded"] is False
+
+
+async def test_amend_reason_is_last_write_wins(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    await fns["amend"](id=out["id"], body="y", reason="first")
+    await fns["amend"](id=out["id"], body="z", reason="second")
+    got = await fns["get_memory"](id=out["id"])
+    assert got["amend_reason"] == "second"
 
 
 async def test_amend_unretract_restores_editability(tools, fake_embed):
