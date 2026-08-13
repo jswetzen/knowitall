@@ -389,13 +389,18 @@ POST_DROP = (
     "CREATE (:Idea {id: $id, body: 'fresh', created_at: $t, "
     "retracted_at: NULL, summary: NULL, amended_at: NULL})"
 )
-if mode == "legacy":
+if mode in ("legacy", "legacy_v7"):
     conn.execute(LEGACY, {"id": row_id, "t": now})
 conn.close()
 db.close()
 del conn, db
 
-stage([4] if mode != "no_drop" else [])
+if mode == "no_drop":
+    stage([])
+elif mode == "legacy_v7":
+    stage([4, 7])
+else:
+    stage([4])
 db = kuzu.Database(str(tmp / "kuzu"))
 conn = kuzu.Connection(db)
 migrate_module.apply_migrations(db)
@@ -464,98 +469,17 @@ def test_updating_a_row_predating_v4s_drop_checkpoints_cleanly(tmp_path):
 # into two separate subprocess invocations against the same on-disk DB. That
 # is the shape a real deploy (migrate once) followed by a later amend() call
 # actually takes.
-_MIGRATE_THROUGH_V7 = """
-import shutil, sys, uuid
-from datetime import datetime, timezone
-from pathlib import Path
-import kuzu
-from schema import migrate as migrate_module
 
-tmp, row_id = Path(sys.argv[1]), sys.argv[2]
-real = Path(migrate_module.__file__).parent
-staging = tmp / "schemas"
-staging.mkdir()
-migrate_module.SCHEMA_DIR = staging
-
-
-def stage(versions):
-    for v in versions:
-        shutil.copy(real / f"v{v}.cypher", staging / f"v{v}.cypher")
-
-
-now = datetime.now(timezone.utc)
-# Legacy row created under v0-v3, before v4's drop.
-stage([0, 1, 2, 3])
-db = kuzu.Database(str(tmp / "kuzu"))
-conn = kuzu.Connection(db)
-migrate_module.apply_migrations(db)
-conn.execute(
-    "CREATE (:Idea {id: $id, body: 'legacy', status: 'open', created_at: $t, "
-    "died_at: NULL, retracted_at: NULL, summary: NULL, amended_at: NULL})",
-    {"id": row_id, "t": now},
-)
-conn.close()
-db.close()
-del conn, db
-
-# Apply the rest of the history, including v7's CHECKPOINT, in one more
-# process/session boundary — matching a real deploy.
-stage([4, 5, 6, 7])
-db = kuzu.Database(str(tmp / "kuzu"))
-conn = kuzu.Connection(db)
-migrate_module.apply_migrations(db)
-conn.close()
-db.close()
-del conn, db
-print("MIGRATED", flush=True)
-"""
-
-_UPDATE_LEGACY_ROW = """
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-import kuzu
-from schema import migrate as migrate_module
-
-tmp, row_id = Path(sys.argv[1]), sys.argv[2]
-migrate_module.SCHEMA_DIR = tmp / "schemas"
-
-now = datetime.now(timezone.utc)
-db = kuzu.Database(str(tmp / "kuzu"))
-conn = kuzu.Connection(db)
-migrate_module.apply_migrations(db)  # no-op: everything already applied
-conn.execute(
-    "MATCH (n:Idea {id: $id}) SET n.body = 'revised', n.amended_at = $t",
-    {"id": row_id, "t": now},
-)
-print("UPDATED", flush=True)
-# Exiting here destroys the Database, which checkpoints — this is where the
-# unpatched sequence segfaults.
-"""
 
 
 def test_updating_a_row_predating_v4s_drop_is_clean_after_v7(tmp_path):
-    """The fix: with v7 applied after v4, a legacy Idea row can be amended
-    (in a later, separate process/session — the real deploy shape) without
-    the checkpoint-time segfault. Companion to the xfail above, which
-    documents the same scenario stopping at v4 (no v7)."""
-    import subprocess
-    import sys
-    import uuid
+    """The fix: v7's CHECKPOINT defuses the same sequence the xfail above
+    segfaults on.
 
-    row_id = str(uuid.uuid4())
-    repo_root = Path(migrate_module.__file__).parent.parent
-
-    migrated = subprocess.run(
-        [sys.executable, "-c", _MIGRATE_THROUGH_V7, str(tmp_path), row_id],
-        cwd=repo_root,
-        capture_output=True,
-    )
-    assert migrated.returncode == 0, migrated.stderr.decode()
-
-    updated = subprocess.run(
-        [sys.executable, "-c", _UPDATE_LEGACY_ROW, str(tmp_path), row_id],
-        cwd=repo_root,
-        capture_output=True,
-    )
-    assert updated.returncode == 0, updated.stderr.decode()
+    Deliberately the SAME-SESSION shape (drop and update in one process),
+    because that is the only shape that actually distinguishes v7 from no
+    v7. Splitting the update into a later process passes with or without
+    v7 — an implicit checkpoint on close already normalises the chunks —
+    so a two-process test here would be one that cannot fail.
+    """
+    assert _run_dropped_column_repro("legacy_v7", tmp_path) == 0
