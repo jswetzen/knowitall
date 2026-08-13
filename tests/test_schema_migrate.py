@@ -441,7 +441,11 @@ def test_updating_a_row_not_predating_v4s_drop_checkpoints_cleanly(mode, tmp_pat
         "updated afterwards. v4 drops Idea.status/died_at, so every Idea "
         "recorded before v4 shipped is affected: amending one crashes the "
         "process on close. Only Idea is affected (v4 is the only DROP). "
-        "Remove this xfail when Kuzu is upgraded past the fix."
+        "No upstream fix exists or is coming — kuzudb/kuzu was archived on "
+        "2025-10-10 and 0.11.3 (2025-10-10) is the final release, with no "
+        "matching issue filed before the archive. So this can only be fixed "
+        "here: rebuild the Idea table so no row predates a drop, or move "
+        "off Kuzu. Until then it is a live hazard, not a deferred one."
     ),
 )
 def test_updating_a_row_predating_v4s_drop_checkpoints_cleanly(tmp_path):
