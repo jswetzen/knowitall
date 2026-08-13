@@ -935,19 +935,30 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             last-write-wins: they describe the most recent change, not a
             revision history.
 
+        Rejections are batched: a payload with several problems reports all
+        of them in one error, so it takes one round trip to fix rather than
+        one per problem.
+
         Returns: {"id", "node_type", "amended_at", "re_embedded": bool,
         "added": [...], "removed": [...], "retracted_at", "retract_reason",
         "amend_reason"}.
         """
+        # Every rejection below discards the whole call, body included, so
+        # one violation per round trip means a caller with two problems in
+        # one payload pays for two rejected writes — and can't see the
+        # second problem until the first is fixed. Collect them all, raise
+        # once. Only an unresolvable id short-circuits, since nothing
+        # label-dependent can be checked without it.
+        problems: list[str] = []
         if summary is not None and len(summary) > SUMMARY_MAX_LEN:
-            raise ValueError(
-                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})."
+            problems.append(
+                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})"
             )
         if (
             body is None and summary is None and not add_anchors
             and not remove_anchors and retract is None and reason is None
         ):
-            raise ValueError(
+            problems.append(
                 "amend requires at least one of body / summary / add_anchors "
                 "/ remove_anchors / retract / reason"
             )
@@ -970,10 +981,20 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             retracted_check.has_next() and retracted_check.get_next()[0] is not None
         )
         if is_retracted and retract is not False:
-            raise ValueError(
+            problems.append(
                 f"cannot amend retracted node {id} — pass retract=False in "
                 "this same call to un-retract it first, or a separate call."
             )
+        if label == "Note" and body is not None and len(body) > SUMMARY_MAX_LEN:
+            problems.append(
+                f"amended note body is {len(body)} chars but a Note "
+                f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
+                "longer content, record a new kind=\"fact\"/\"idea\"/"
+                "\"decision\"/\"task\" instead; don't grow a note past "
+                "a title."
+            )
+        if problems:
+            raise ValueError("; ".join(problems))
 
         now = _now()
         fields = _LIST_FIELDS[label]
@@ -983,16 +1004,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         re_embedded = False
         if body is not None:
-            if label == "Note" and len(body) > SUMMARY_MAX_LEN:
-                raise ValueError(
-                    f"amended note body is {len(body)} chars but a Note "
-                    f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
-                    "longer content, record a new kind=\"fact\"/\"idea\"/"
-                    "\"decision\"/\"task\" instead; don't grow a note past "
-                    "a title."
-                )
             # Note's body lives in `title`, clipped at SUMMARY_MAX_LEN — a
-            # no-op now that the length is validated above.
+            # no-op now that the length is validated up front.
             stored_body = body[:SUMMARY_MAX_LEN] if label == "Note" else body
             conn.execute(
                 f"MATCH (n:{label} {{id: $id}}) SET n.{body_field} = $b",

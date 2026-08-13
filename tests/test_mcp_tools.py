@@ -1250,6 +1250,22 @@ async def test_amend_rejects_oversize_summary(tools, fake_embed):
         await fns["amend"](id=out["id"], summary="y" * 201)
 
 
+async def test_amend_reports_every_violation_at_once(tools, fake_embed):
+    """One rejection per round trip hid later problems behind earlier ones."""
+    fns, _ = tools
+    stored = await fns["record"](kind="note", body="short title")
+    await fns["amend"](id=stored["id"], retract=True, reason="dup")
+
+    with pytest.raises(ValueError) as exc:
+        await fns["amend"](
+            id=stored["id"], body="b" * 201, summary="s" * 201
+        )
+    msg = str(exc.value)
+    assert "summary too long" in msg
+    assert "cannot amend retracted" in msg
+    assert "note body is 201 chars" in msg
+
+
 async def test_amend_add_anchors(tools, fake_embed):
     fns, _ = tools
     out = await fns["record"](kind="decision", body="d", project_hint="ap")
