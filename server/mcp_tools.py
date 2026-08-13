@@ -633,100 +633,48 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         """Record a durable memory: decision / task / idea / note / summary /
         blocker / fact / solution / episode.
 
-        Write tool. One polymorphic entry point — pick `kind` per the taxonomy
-        below; the server creates the right graph node and a matching embedding
-        row so future `query_memory` calls can find it semantically.
+        Write tool. Pick `kind` per the taxonomy below; the server creates the
+        right graph node plus an embedding row so `query_memory` finds it
+        later. Memories are SHARED across every AI tool on this server (Claude
+        Code, Codex, Cursor) — write for the next agent, not just future-you.
 
-        ARGUMENT SHAPES (first, deliberately: tool descriptions get truncated
-        around 2k chars by some clients, and these are the only parts of this
-        docstring you cannot guess — everything below is prose you can lose):
-          anchors: [{"kind": ..., ...}] — the key is "kind", NOT "type".
+        ARGUMENT SHAPES (the parts you cannot guess; rest is prose):
+          anchors: [{"kind": ..., ...}] — key is "kind", NOT "type".
             "commit" needs "sha" (+"repo"); "file" needs "path" (+"repo");
             "project"/"concept" need "name"; "symbol" needs "name"+"file";
-            "person" needs "email".
+            "person" needs "email". Same shape in `amend`'s add_anchors and
+            `update_todo`'s anchors. Pass MULTIPLE project/concept anchors
+            to scope cross-cutting knowledge (README: "Scoping memories
+            across projects").
           relates_to: [{"kind": "supersedes"|"refines"|"contradicts"|
-            "relates_to"|"blocks", "id": "<existing memory id>"}] — the key
-            is "id", NOT "target_id". Only the RESPONSE uses "target_id";
-            input and output name the same concept differently.
-          summary: <=200 chars. For kind="note", body is <=200 chars too.
-        Same anchor shape is used by `amend`'s add_anchors and
-        `update_todo`'s anchors.
+            "relates_to"|"blocks", "id": "<memory id>"}] — key is "id", NOT
+            "target_id" (only the RESPONSE uses "target_id"). "blocks"
+            requires Task→Task. Bad ids raise before any write.
+          body: self-contained prose, readable without surrounding chat.
+          summary: <=200 chars, title-shaped; falls back to body's first 200.
+          project_hint: project NAME (not id); created if novel.
+          Ids anywhere accept unambiguous >=8-char prefixes.
 
-        Memories are SHARED across every AI tool connected to this knowitall
-        server (Claude Code, Codex, Cursor, etc.). Write for the next agent
-        — possibly running in a different tool — not just for future-you in
-        this session.
+        kind: "decision"|"task"|"idea"|"note" become first-class graph nodes
+        (citable, edge targets). "summary"|"blocker"|"fact"|"solution"|
+        "episode" become Episode nodes carrying the kind, for narrative
+        content. "note" is title-only — a body over 200 chars is REJECTED;
+        use "fact"/"idea"/"decision"/"task" for anything longer.
 
-        Use this when something would be useful in a FUTURE session,
-        after the current context window is gone. Good triggers:
-          - The user states something durable about themselves or the project
-            ("we always do X", "next we want Y", "Z is the blocker").
-          - A design decision is made — capture the choice AND the rationale.
-          - A bug is tracked down — capture the root cause and the fix.
-          - A tricky env/setup/import/config issue was resolved — capture it
-            as `kind="solution"`. Future-you (or another AI tool) WILL hit
-            this again; the lookup is only useful if the entry is findable.
-          - A feature is finished — capture what was built.
-          - Session is wrapping up: proactively ASK before storing a `summary`.
+        Record what will matter in a FUTURE session: durable statements about
+        the user or project, decisions WITH rationale, root causes and their
+        fixes, finished work. Not for debug output, anything already in git or
+        code, or speculation the user hasn't endorsed. When a session wraps
+        up, ASK before storing a `summary`.
 
-        Do NOT use for: transient debug output, things already captured in git
-        or code, scratchpad thinking, or speculative ideas the user hasn't
-        endorsed.
-
-        kind taxonomy:
-          - "decision" | "task" | "idea" | "note": become first-class graph
-            nodes (citable, expandable, can be the target of edges).
-          - "summary" | "blocker" | "fact" | "solution" | "episode": become
-            Episode nodes carrying the kind, for less structural / more
-            narrative content.
-          - "note" is title-only: <=200 chars, no long body column. A body
-            over 200 chars is REJECTED — use "fact"/"idea"/"decision"/"task"
-            for anything longer than a title (see PLAN.md for why `note`
-            is shaped this way).
-
-        kind="solution" body shape (FOLLOW THIS — semantic retrieval depends
-        on it):
-          Line 1: the verbatim error string or exact symptom (paste it,
-                  don't paraphrase). This is what future-you will search.
-          Line 2: the command / context that surfaces it.
-          Body:   the fix, and how you verified it worked.
-          Last line: `Discoverable keywords: <3-5 paraphrases the future
-                  searcher might type>` — embedding models cluster on
-                  lexical neighbors, so paraphrases on the page widen
-                  the recall surface.
-        After recording, run `query_memory` with the symptom phrasing you
-        expect future-you to use. If your entry isn't top-1, amend the body
-        until it is. If a similar solution already exists, `amend` it
-        instead of recording a duplicate — duplicates split the embedding
-        signal and bury the right answer.
-
-        body: self-contained prose. Must be readable without surrounding chat.
-
-        project_hint: project NAME (not id). If novel, a Project node is
-        created. Omit to leave unattached.
-
-        anchors (shape above): typed JSON citations. Existing nodes are
-        reused by natural key. Pass MULTIPLE project/concept anchors to
-        scope shared/cross-cutting knowledge (an internal library, a
-        framework gotcha) so it surfaces under every anchor's
-        `query_memory`/`list_memories` hint — worked examples in README's
-        "Scoping memories across projects".
-
-        summary: optional ≤200-char title-shaped string surfaced by
-        `list_memories` and `get_memory`. If omitted, those tools fall
-        back to the first 200 chars of body. Validation rejects strings
-        longer than 200 — fail at write-time rather than silently
-        truncate. For `kind="note"` the summary writes to the
-        existing `title` column (Note has no parallel summary field) —
-        since a Note IS its title, `summary` and `body` are two names for
-        the same ≤200-char string on a Note.
-
-        relates_to (shape above): optional memory→memory edges. Target ids
-        are validated (must resolve to a memory-bearing node) — bad ids
-        raise ValueError before any state changes. Ids may be given as
-        unambiguous >=8-char prefixes. "blocks" additionally requires both
-        endpoints be Task nodes (the underlying BLOCKS edge is Task→Task
-        only).
+        kind="solution" (env/setup/config gotchas) — retrieval depends on the
+        body shape: line 1 the verbatim error string (paste, don't
+        paraphrase), line 2 the command that surfaces it, then the fix and
+        how you verified it, last line `Discoverable keywords: <3-5
+        paraphrases a future searcher might type>`. Then run `query_memory`
+        with the phrasing you'd expect; if it isn't top-1, amend until it is.
+        Amend a near-duplicate rather than adding one — duplicates split the
+        embedding signal.
 
         Returns: {"id", "node_type", "project_id", "anchored": [...],
         "related": [...]}.
