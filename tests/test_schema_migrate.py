@@ -389,18 +389,13 @@ POST_DROP = (
     "CREATE (:Idea {id: $id, body: 'fresh', created_at: $t, "
     "retracted_at: NULL, summary: NULL, amended_at: NULL})"
 )
-if mode in ("legacy", "legacy_v7"):
+if mode == "legacy":
     conn.execute(LEGACY, {"id": row_id, "t": now})
 conn.close()
 db.close()
 del conn, db
 
-if mode == "no_drop":
-    stage([])
-elif mode == "legacy_v7":
-    stage([4, 7])
-else:
-    stage([4])
+stage([4] if mode != "no_drop" else [])
 db = kuzu.Database(str(tmp / "kuzu"))
 conn = kuzu.Connection(db)
 migrate_module.apply_migrations(db)
@@ -448,38 +443,12 @@ def test_updating_a_row_not_predating_v4s_drop_checkpoints_cleanly(mode, tmp_pat
         "process on close. Only Idea is affected (v4 is the only DROP). "
         "No upstream fix exists or is coming — kuzudb/kuzu was archived on "
         "2025-10-10 and 0.11.3 (2025-10-10) is the final release, with no "
-        "matching issue filed before the archive. This documents the raw "
-        "bug with only v0-v4 applied (no v7). It stays accurate: v7 fixes "
-        "the hazard going forward by checkpointing after the drop, but "
-        "doesn't change what v4-without-v7 does on its own — see "
-        "test_updating_a_row_predating_v4s_drop_is_clean_after_v7 for the "
-        "fixed sequence."
+        "matching issue filed before the archive. A CHECKPOINT after the "
+        "DROP fixes this on toy databases but hangs indefinitely on a "
+        "real one, so it is not a usable remedy — see docs/kuzu-drop-"
+        "column-hazard.md. Mitigation for now is operational: don't "
+        "amend a pre-v4 Idea in the same process that applied v4."
     ),
 )
 def test_updating_a_row_predating_v4s_drop_checkpoints_cleanly(tmp_path):
     assert _run_dropped_column_repro("legacy", tmp_path) == 0
-
-
-# --- v7 fix: CHECKPOINT after v4's DROP defuses the hazard ---
-
-# Same repro shape as _DROPPED_COLUMN_REPRO, but applies the full migration
-# history (including v7) before the UPDATE, and — because the real hazard is
-# about a DROP-then-later-UPDATE sequence spanning process/session
-# boundaries, not just one Database lifetime — splits migrating and updating
-# into two separate subprocess invocations against the same on-disk DB. That
-# is the shape a real deploy (migrate once) followed by a later amend() call
-# actually takes.
-
-
-
-def test_updating_a_row_predating_v4s_drop_is_clean_after_v7(tmp_path):
-    """The fix: v7's CHECKPOINT defuses the same sequence the xfail above
-    segfaults on.
-
-    Deliberately the SAME-SESSION shape (drop and update in one process),
-    because that is the only shape that actually distinguishes v7 from no
-    v7. Splitting the update into a later process passes with or without
-    v7 — an implicit checkpoint on close already normalises the chunks —
-    so a two-process test here would be one that cannot fail.
-    """
-    assert _run_dropped_column_repro("legacy_v7", tmp_path) == 0
