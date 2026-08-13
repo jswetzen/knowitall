@@ -48,10 +48,16 @@ It shipped briefly as `schema/v7.cypher` and **was reverted**, because it does
 not survive contact with a real database:
 
 - On the toy DBs the tests build (a handful of rows): completes instantly.
-- On the production store (~300 MB, ~570 files): **hangs indefinitely.**
-  Observed >60s under two independent harnesses, with and without a stale
+- On the production store (~300 MB, ~570 files): stalls for roughly fifteen
+  minutes and then **segfaults** (exit 139). Observed with and without a stale
   `kuzu.shadow` present, on both the live data directory and a clean restore
   from backup.
+
+That ending matters more than the stall. A forced full checkpoint walks the
+whole store and eventually reaches the very chunks this bug is about — so the
+crash is not incidental to `CHECKPOINT`, it *is* the drop-column bug, and it
+proves the damaged chunk state is genuinely present in the live `Idea` table
+rather than being a hypothetical.
 
 Because migrations run inside `build_state()` during startup, this hung the
 server before uvicorn produced a single line of output, and systemd SIGKILLed
@@ -63,16 +69,29 @@ startup against the real store, so anything whose cost scales with data size
 can turn a deploy into an outage.** The test suite's small fixtures cannot
 catch that class of problem.
 
-## Current mitigation
+## Where this actually leaves us
 
-Operational, not code:
+Normal operation is fine and has been all along: the incremental checkpoint
+that runs when the database closes does not touch the damaged chunks, which is
+why the server starts, stops, and serves without trouble. What crashes is a
+*forced full* checkpoint.
 
-1. Do not amend a pre-`DROP` `Idea` row in the same process that applied v4.
-   Already satisfied — v4 is long applied.
-2. If a future migration drops a column, restart the service once, with no
-   writes in between, before serving traffic. The close-checkpoint normalises
-   the chunks, which is the same effect `CHECKPOINT` was reaching for, without
-   running it inline during startup.
+So there are two separate things, and only the first is closed:
+
+1. **The same-session crash** — closed. v4 is long applied and is the only
+   `DROP`, so no future session can be the one that applied it.
+2. **The latent chunk damage in `Idea`** — still there, and not fixable with
+   Kùzu 0.11.3, because every tool that would rewrite the table (`CHECKPOINT`,
+   and by extension anything doing a full rebuild) hits the same bug. It is
+   harmless until something forces a full checkpoint.
+
+Mitigation is therefore operational, not code:
+
+- Don't run `CHECKPOINT` against the production store.
+- If a future migration drops a column, restart the service once with no
+  writes in between before serving traffic, rather than checkpointing inline.
+- Take the backup before any migration deploy. That is what made this
+  recoverable.
 
 ## Upstream
 
@@ -81,7 +100,11 @@ There is no upstream fix and there will not be one: kuzudb/kuzu was archived
 nothing matching; the nearest neighbour (#4777, drop-then-add breaking
 insert/copy, fixed in #4786) is a different sequence and not a crash.
 
-This is one of the arguments for eventually replacing Kùzu.
+This is now the strongest argument for replacing Kùzu: the store carries
+damage that the engine itself cannot repair, and the engine will never be
+fixed. A migration onto a different backend is also the natural moment to
+rebuild the `Idea` table cleanly, since the data would be read out and
+rewritten anyway.
 
 ## Regression coverage
 
