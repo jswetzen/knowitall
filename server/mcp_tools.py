@@ -517,6 +517,15 @@ def _apply_relates_to(
                 f"Allowed: {sorted(MEMORY_EDGE_KIND_TO_LABEL)}"
             )
         if not target_id:
+            # `record`'s RETURN echoes anchors back as "target_id", so that's
+            # the natural guess on the way back in — but the input key is
+            # "id". Say so instead of just naming the missing key.
+            if spec.get("target_id"):
+                raise ValueError(
+                    f"relates_to entry missing 'id' — got 'target_id' instead; "
+                    f"relates_to takes 'id' on input (only the returned "
+                    f"'anchored'/'related' envelopes use 'target_id'): {spec}"
+                )
             raise ValueError(f"relates_to entry missing 'id': {spec}")
         target_label = _lookup_node_label(conn, target_id)
         if target_label is None:

@@ -987,6 +987,39 @@ async def test_record_relates_to_unknown_target_raises(tools, fake_embed):
         )
 
 
+async def test_record_relates_to_target_id_names_the_right_key(tools, fake_embed):
+    """"target_id" is the return-envelope key; on input it must be "id"."""
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="got 'target_id' instead"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            relates_to=[{"kind": "supersedes", "target_id": a["id"]}],
+        )
+
+
+async def test_record_anchor_type_names_the_right_key(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="got 'type' instead"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            anchors=[{"type": "commit", "sha": "deadbeef", "repo": "knowitall"}],
+        )
+
+
+async def test_update_todo_anchor_type_names_the_right_key(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="task", body="ship thing")
+    with pytest.raises(ValueError, match="got 'type' instead"):
+        await fns["update_todo"](
+            id=stored["id"],
+            status="done",
+            anchors=[{"type": "commit", "sha": "deadbeef", "repo": "knowitall"}],
+        )
+
+
 async def test_record_relates_to_blocks_writes_typed_edge(tools, fake_embed):
     # Task→Task blocks should write the v1 BLOCKS edge, not the generic
     # RELATES_TO_MEMORY. This is what `relates_to: kind="blocks"` exists for.

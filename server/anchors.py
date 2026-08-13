@@ -222,6 +222,13 @@ def resolve_anchor(
     """
     kind = anchor.get("kind")
     if not kind:
+        # "type" is the natural first guess and costs a round trip to
+        # unlearn — name the right key rather than just the missing one.
+        if anchor.get("type"):
+            raise ValueError(
+                f"anchor missing 'kind' — got 'type' instead; anchors key on "
+                f"'kind' (e.g. {{\"kind\": \"{anchor['type']}\", ...}}): {anchor}"
+            )
         raise ValueError(f"anchor missing 'kind': {anchor}")
     if kind == "commit":
         sha = anchor.get("sha")
