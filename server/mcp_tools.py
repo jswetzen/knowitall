@@ -253,15 +253,57 @@ def _create_graph_node(
         raise ValueError(f"unknown graph label: {label}")
 
 
-def _lookup_node_label(conn, node_id: str) -> str | None:
-    """Find which memory-bearing label owns this id. None if unknown/retracted."""
-    for label in ANCHOR_SOURCE_LABELS:
+# Shortest id prefix `_resolve_node_id` will try to expand. Ids are UUID4, so
+# 8 hex chars is ~4 billion values — effectively collision-free at any corpus
+# size this server will see, and it's the form that actually appears in
+# conversation (chat, commit messages, the user's own requests). Anything
+# shorter is more likely a typo than an abbreviation, so we don't scan for it.
+_ID_PREFIX_MIN_LEN = 8
+
+
+def _resolve_node_id(conn, node_id: str) -> tuple[str, str] | None:
+    """Resolve an id to (owning label, full id). None if nothing matches.
+
+    Accepts either a full id or an unambiguous prefix of >= 8 chars. Exact
+    matches always win and cost one indexed lookup per label; the prefix scan
+    only runs when the exact lookup missed. Kùzu has no prefix index on `id`,
+    so that fallback is a full scan per label — acceptable because it is the
+    error path, not the hot path.
+
+    Raises ValueError if a prefix matches more than one node, listing the
+    candidates so the caller can disambiguate without a `list_memories` sweep.
+    """
+    # Sorted for deterministic label order — ANCHOR_SOURCE_LABELS is a set,
+    # which doesn't matter for exact ids but would make ambiguity reporting
+    # non-reproducible.
+    labels = sorted(ANCHOR_SOURCE_LABELS)
+    for label in labels:
         result = conn.execute(
             f"MATCH (n:{label} {{id: $id}}) RETURN n.id LIMIT 1", {"id": node_id}
         )
         if result.has_next():
-            return label
-    return None
+            return (label, node_id)
+
+    if len(node_id) < _ID_PREFIX_MIN_LEN:
+        return None
+
+    matches: list[tuple[str, str]] = []
+    for label in labels:
+        result = conn.execute(
+            f"MATCH (n:{label}) WHERE starts_with(n.id, $p) RETURN n.id",
+            {"p": node_id},
+        )
+        while result.has_next():
+            matches.append((label, str(result.get_next()[0])))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        listed = ", ".join(f"{mid} ({lbl})" for lbl, mid in sorted(matches))
+        raise ValueError(
+            f"id prefix {node_id!r} is ambiguous — {len(matches)} matches: "
+            f"{listed}. Pass a longer prefix or the full id."
+        )
+    return matches[0]
 
 
 # Anchor-hint kinds that query_memory/list_memories accept as a scope. Each
@@ -527,11 +569,13 @@ def _apply_relates_to(
                     f"'anchored'/'related' envelopes use 'target_id'): {spec}"
                 )
             raise ValueError(f"relates_to entry missing 'id': {spec}")
-        target_label = _lookup_node_label(conn, target_id)
-        if target_label is None:
+        resolved = _resolve_node_id(conn, target_id)
+        if resolved is None:
             raise ValueError(
                 f"relates_to target {target_id!r} is not a memory node"
             )
+        # Expanded so the edge is written against the full id, not the prefix.
+        target_label, target_id = resolved
         endpoints = MEMORY_EDGE_ENDPOINTS.get(kind)
         if endpoints is not None:
             allowed_from, allowed_to = endpoints
@@ -772,6 +816,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         blocked, completed, or abandoned. Optional anchors record what closed
         or blocked the task — typically a commit anchor for "done".
 
+        id: the Task id from `record` / `list_memories`. An unambiguous
+          prefix of >=8 chars also resolves.
         status: free-form, but conventional values are
           "open" | "in_progress" | "blocked" | "done" | "abandoned".
         anchors: same shape as `record`'s `anchors` — a list of typed JSON
@@ -788,11 +834,18 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         conn = state.kuzu_conn()
         now = _now()
         # Verify Task exists and isn't retracted.
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
+            raise ValueError(f"no Task with id={id}")
+        label, id = resolved
+        if label != "Task":
+            raise ValueError(
+                f"id={id} is a {label.lower()}, not a task — update_todo only "
+                "transitions tasks. Use amend to edit other memory kinds."
+            )
         result = conn.execute(
             "MATCH (t:Task {id: $id}) RETURN t.retracted_at LIMIT 1", {"id": id}
         )
-        if not result.has_next():
-            raise ValueError(f"no Task with id={id}")
         row = result.get_next()
         if row[0] is not None:
             raise ValueError(f"Task {id} is retracted")
@@ -847,7 +900,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         etc.) keep pointing at the right thing.
 
         Args:
-          id: the node id returned by `record` / `list_memories`.
+          id: the node id returned by `record` / `list_memories`. An
+            unambiguous prefix of >=8 chars also resolves.
           body: if provided, replaces the stored body AND re-embeds. The
             old embedding row is deleted and a fresh one inserted, so
             subsequent `query_memory` calls reflect the new wording. For
@@ -898,9 +952,11 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             )
 
         conn = state.kuzu_conn()
-        label = _lookup_node_label(conn, id)
-        if label is None:
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
             raise ValueError(f"no memory node with id={id}")
+        # Every write below keys on the full id, so rebind before using it.
+        label, id = resolved
 
         # Retracted nodes reject every edit except un-retracting (retract=
         # False) — addressable via get_memory either way, but not silently
@@ -1443,6 +1499,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         Args:
           id: the node id returned by `record` / `list_memories` / etc.
+            An unambiguous prefix of >=8 chars also resolves (the short
+            form that appears in chat and commit messages); the returned
+            `id` is always the full one. An ambiguous prefix raises with
+            the candidates listed.
           include_neighbors: if True, also returns 1-hop ANCHORED_TO
             neighbors (same shape as `query_memory` neighbors).
 
@@ -1450,9 +1510,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         retracted_at, neighbors?} or None if no memory has that id.
         """
         conn = state.kuzu_conn()
-        label = _lookup_node_label(conn, id)
-        if label is None:
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
             return None
+        label, id = resolved
 
         fields = _LIST_FIELDS[label]
         ts_field = fields["created_at_field"]
