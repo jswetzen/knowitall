@@ -650,8 +650,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         summary: optional ≤200-char title-shaped string surfaced by
         `list_memories` and `get_memory`. If omitted, those tools fall
         back to the first 200 chars of body. Validation rejects strings
-        longer than SUMMARY_MAX_LEN — fail at write-time rather than
-        silently truncate. For `kind="note"` the summary writes to the
+        longer than 200 — fail at write-time rather than silently
+        truncate. For `kind="note"` the summary writes to the
         existing `title` column (Note has no parallel summary field) —
         since a Note IS its title, `summary` and `body` are two names for
         the same ≤200-char string on a Note.
@@ -765,6 +765,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         status: free-form, but conventional values are
           "open" | "in_progress" | "blocked" | "done" | "abandoned".
+        anchors: same shape as `record`'s `anchors` — a list of typed JSON
+          citations keyed on "kind" (NOT "type"), e.g.
+          [{"kind":"commit","sha":"abc123","repo":"knowitall"}]. See
+          `record`'s docstring for the per-kind required fields.
         When status=="done" and a commit anchor is provided, a CLOSED_BY edge
         is also written from Task to Commit. Every call bumps `amended_at`,
         so a date-window query (`list_memories`'s since/until) catches
@@ -844,8 +848,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             past a title.
           summary: if provided, replaces the stored summary. Pure graph
             SET — no re-embed (summary is not part of the embedded text).
-            For `kind=note` the value writes to `title`. Validated against
-            SUMMARY_MAX_LEN.
+            For `kind=note` the value writes to `title`. Must be <=200
+            chars, same limit `record`'s `summary` enforces.
           add_anchors: list of typed anchor JSON (same shapes as
             `record`'s `anchors` arg) to add. Idempotent — existing
             ANCHORED_TO edges are not duplicated.
