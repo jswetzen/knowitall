@@ -35,6 +35,22 @@ def _stage_schemas(staging_dir: Path, versions: list[int]) -> None:
         shutil.copy(src, staging_dir / src.name)
 
 
+def _all_schema_versions() -> list[int]:
+    """Every vN.cypher that exists, so upgrade tests don't pin to a version.
+
+    A real deploy runs `apply_migrations`, which applies everything pending —
+    not just the version that happened to be newest when a test was written.
+    Staging a fixed list made "upgrade to current" silently mean "upgrade to
+    v3" as the schema moved on.
+    """
+    real_schema_dir = Path(migrate_module.__file__).parent
+    return sorted(
+        int(m.group(1))
+        for p in real_schema_dir.glob("v*.cypher")
+        if (m := migrate_module.MIGRATION_RE.match(p.name))
+    )
+
+
 @pytest.fixture
 def staged_schema_dir(tmp_path, monkeypatch):
     """Returns a Path that callers populate with selected vN.cypher files.
@@ -272,18 +288,30 @@ def test_v3_upgrade_then_record_amend_via_mcp(
     from server.mcp_tools import register_tools
 
     state = build_state()
-    legacy_idea_id = str(uuid.uuid4())
+    # A Decision, not an Idea: v4 DROPs Idea.status/died_at, and amending a
+    # row that predates a dropped column segfaults Kuzu 0.11.3 on checkpoint
+    # (see test_amending_a_row_that_predates_v4s_drop_survives_checkpoint).
+    # Decision is untouched by v4, so this test exercises what it's actually
+    # for — a legacy row revised after a full upgrade — without riding on
+    # that bug. Legacy-Idea survival through v4 is covered by
+    # test_v4_drops_idea_status_and_died_at.
+    legacy_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     conn = state.kuzu_conn()
     conn.execute(
-        "CREATE (:Idea {id: $id, body: 'legacy body', status: 'open', "
-        "created_at: $t, died_at: NULL, retracted_at: NULL})",
-        {"id": legacy_idea_id, "t": now},
+        "CREATE (:Decision {id: $id, body: 'legacy body', decided_at: $t, "
+        "retracted_at: NULL})",
+        {"id": legacy_id, "t": now},
     )
+    # Close before reopening the same path in phase 2 rather than leaning on
+    # refcounting to do it at the right moment.
+    conn.close()
+    state.kuzu_db.close()
     del state, conn
 
-    # Phase 2: stage v3, rebuild state (which triggers migration).
-    _stage_schemas(staged_schema_dir, [3])
+    # Phase 2: stage every remaining migration (what a deploy actually
+    # applies), rebuild state (which triggers migration).
+    _stage_schemas(staged_schema_dir, _all_schema_versions())
     state = build_state()
 
     class _Recorder:
@@ -298,11 +326,11 @@ def test_v3_upgrade_then_record_amend_via_mcp(
     rec = _Recorder()
     register_tools(rec, state)
 
-    # The legacy idea is addressable via get_memory. Drive the async tool
+    # The legacy row is addressable via get_memory. Drive the async tool
     # explicitly with asyncio.run — this test isn't async itself because the
     # migration phases need to happen synchronously between fixtures.
     import asyncio
-    got = asyncio.run(rec.tools["get_memory"](id=legacy_idea_id))
+    got = asyncio.run(rec.tools["get_memory"](id=legacy_id))
     assert got is not None
     assert got["body"] == "legacy body"
     assert got["summary"] == "legacy body"  # falls back to body since no stored summary
@@ -312,13 +340,146 @@ def test_v3_upgrade_then_record_amend_via_mcp(
     with patch("server.mcp_tools.embed", new=AsyncMock(return_value=vec)):
         res = asyncio.run(
             rec.tools["amend"](
-                id=legacy_idea_id,
+                id=legacy_id,
                 body="revised body",
                 summary="revised summary",
             )
         )
     assert res["re_embedded"] is True
 
-    got = asyncio.run(rec.tools["get_memory"](id=legacy_idea_id))
+    got = asyncio.run(rec.tools["get_memory"](id=legacy_id))
     assert got["body"] == "revised body"
     assert got["summary"] == "revised summary"
+
+
+# --- known Kuzu bug: updating a row that predates a dropped column ---
+
+# Runs in a subprocess: the failure mode is SIGSEGV inside Kuzu's checkpoint,
+# which pytest cannot trap in-process — it would take the whole session down.
+_DROPPED_COLUMN_REPRO = """
+import shutil, sys, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+import kuzu
+from schema import migrate as migrate_module
+
+mode, tmp = sys.argv[1], Path(sys.argv[2])
+real = Path(migrate_module.__file__).parent
+staging = tmp / "schemas"
+staging.mkdir()
+migrate_module.SCHEMA_DIR = staging
+
+
+def stage(versions):
+    for v in versions:
+        shutil.copy(real / f"v{v}.cypher", staging / f"v{v}.cypher")
+
+
+now = datetime.now(timezone.utc)
+stage([0, 1, 2, 3])
+db = kuzu.Database(str(tmp / "kuzu"))
+conn = kuzu.Connection(db)
+migrate_module.apply_migrations(db)
+row_id = str(uuid.uuid4())
+LEGACY = (
+    "CREATE (:Idea {id: $id, body: 'legacy', status: 'open', created_at: $t, "
+    "died_at: NULL, retracted_at: NULL, summary: NULL, amended_at: NULL})"
+)
+POST_DROP = (
+    "CREATE (:Idea {id: $id, body: 'fresh', created_at: $t, "
+    "retracted_at: NULL, summary: NULL, amended_at: NULL})"
+)
+if mode in ("legacy", "legacy_v7"):
+    conn.execute(LEGACY, {"id": row_id, "t": now})
+conn.close()
+db.close()
+del conn, db
+
+if mode == "no_drop":
+    stage([])
+elif mode == "legacy_v7":
+    stage([4, 7])
+else:
+    stage([4])
+db = kuzu.Database(str(tmp / "kuzu"))
+conn = kuzu.Connection(db)
+migrate_module.apply_migrations(db)
+if mode == "post_drop":
+    conn.execute(POST_DROP, {"id": row_id, "t": now})
+elif mode == "no_drop":
+    conn.execute(LEGACY, {"id": row_id, "t": now})
+conn.execute(
+    "MATCH (n:Idea {id: $id}) SET n.body = 'revised', n.amended_at = $t",
+    {"id": row_id, "t": now},
+)
+# Exiting here destroys the Database, which checkpoints. That is where the
+# segfault lands for mode="legacy".
+"""
+
+
+def _run_dropped_column_repro(mode: str, tmp_path: Path) -> int:
+    """Run the repro in a clean interpreter. Returns its exit code."""
+    import subprocess
+    import sys
+
+    workdir = tmp_path / mode
+    workdir.mkdir()
+    repo_root = Path(migrate_module.__file__).parent.parent
+    return subprocess.run(
+        [sys.executable, "-c", _DROPPED_COLUMN_REPRO, mode, str(workdir)],
+        cwd=repo_root,
+        capture_output=True,
+    ).returncode
+
+
+@pytest.mark.parametrize("mode", ["post_drop", "no_drop"])
+def test_updating_a_row_not_predating_v4s_drop_checkpoints_cleanly(mode, tmp_path):
+    """Control cases for the xfail below — these must stay clean."""
+    assert _run_dropped_column_repro(mode, tmp_path) == 0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Kuzu 0.11.3 segfaults in ChunkedNodeGroup::scanCommitted during "
+        "checkpoint when a row created BEFORE an ALTER TABLE ... DROP is "
+        "updated afterwards. v4 drops Idea.status/died_at, so every Idea "
+        "recorded before v4 shipped is affected: amending one crashes the "
+        "process on close. Only Idea is affected (v4 is the only DROP). "
+        "No upstream fix exists or is coming — kuzudb/kuzu was archived on "
+        "2025-10-10 and 0.11.3 (2025-10-10) is the final release, with no "
+        "matching issue filed before the archive. This documents the raw "
+        "bug with only v0-v4 applied (no v7). It stays accurate: v7 fixes "
+        "the hazard going forward by checkpointing after the drop, but "
+        "doesn't change what v4-without-v7 does on its own — see "
+        "test_updating_a_row_predating_v4s_drop_is_clean_after_v7 for the "
+        "fixed sequence."
+    ),
+)
+def test_updating_a_row_predating_v4s_drop_checkpoints_cleanly(tmp_path):
+    assert _run_dropped_column_repro("legacy", tmp_path) == 0
+
+
+# --- v7 fix: CHECKPOINT after v4's DROP defuses the hazard ---
+
+# Same repro shape as _DROPPED_COLUMN_REPRO, but applies the full migration
+# history (including v7) before the UPDATE, and — because the real hazard is
+# about a DROP-then-later-UPDATE sequence spanning process/session
+# boundaries, not just one Database lifetime — splits migrating and updating
+# into two separate subprocess invocations against the same on-disk DB. That
+# is the shape a real deploy (migrate once) followed by a later amend() call
+# actually takes.
+
+
+
+def test_updating_a_row_predating_v4s_drop_is_clean_after_v7(tmp_path):
+    """The fix: v7's CHECKPOINT defuses the same sequence the xfail above
+    segfaults on.
+
+    Deliberately the SAME-SESSION shape (drop and update in one process),
+    because that is the only shape that actually distinguishes v7 from no
+    v7. Splitting the update into a later process passes with or without
+    v7 — an implicit checkpoint on close already normalises the chunks —
+    so a two-process test here would be one that cannot fail.
+    """
+    assert _run_dropped_column_repro("legacy_v7", tmp_path) == 0

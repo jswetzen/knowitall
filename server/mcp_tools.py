@@ -253,15 +253,57 @@ def _create_graph_node(
         raise ValueError(f"unknown graph label: {label}")
 
 
-def _lookup_node_label(conn, node_id: str) -> str | None:
-    """Find which memory-bearing label owns this id. None if unknown/retracted."""
-    for label in ANCHOR_SOURCE_LABELS:
+# Shortest id prefix `_resolve_node_id` will try to expand. Ids are UUID4, so
+# 8 hex chars is ~4 billion values — effectively collision-free at any corpus
+# size this server will see, and it's the form that actually appears in
+# conversation (chat, commit messages, the user's own requests). Anything
+# shorter is more likely a typo than an abbreviation, so we don't scan for it.
+_ID_PREFIX_MIN_LEN = 8
+
+
+def _resolve_node_id(conn, node_id: str) -> tuple[str, str] | None:
+    """Resolve an id to (owning label, full id). None if nothing matches.
+
+    Accepts either a full id or an unambiguous prefix of >= 8 chars. Exact
+    matches always win and cost one indexed lookup per label; the prefix scan
+    only runs when the exact lookup missed. Kùzu has no prefix index on `id`,
+    so that fallback is a full scan per label — acceptable because it is the
+    error path, not the hot path.
+
+    Raises ValueError if a prefix matches more than one node, listing the
+    candidates so the caller can disambiguate without a `list_memories` sweep.
+    """
+    # Sorted for deterministic label order — ANCHOR_SOURCE_LABELS is a set,
+    # which doesn't matter for exact ids but would make ambiguity reporting
+    # non-reproducible.
+    labels = sorted(ANCHOR_SOURCE_LABELS)
+    for label in labels:
         result = conn.execute(
             f"MATCH (n:{label} {{id: $id}}) RETURN n.id LIMIT 1", {"id": node_id}
         )
         if result.has_next():
-            return label
-    return None
+            return (label, node_id)
+
+    if len(node_id) < _ID_PREFIX_MIN_LEN:
+        return None
+
+    matches: list[tuple[str, str]] = []
+    for label in labels:
+        result = conn.execute(
+            f"MATCH (n:{label}) WHERE starts_with(n.id, $p) RETURN n.id",
+            {"p": node_id},
+        )
+        while result.has_next():
+            matches.append((label, str(result.get_next()[0])))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        listed = ", ".join(f"{mid} ({lbl})" for lbl, mid in sorted(matches))
+        raise ValueError(
+            f"id prefix {node_id!r} is ambiguous — {len(matches)} matches: "
+            f"{listed}. Pass a longer prefix or the full id."
+        )
+    return matches[0]
 
 
 # Anchor-hint kinds that query_memory/list_memories accept as a scope. Each
@@ -517,12 +559,23 @@ def _apply_relates_to(
                 f"Allowed: {sorted(MEMORY_EDGE_KIND_TO_LABEL)}"
             )
         if not target_id:
+            # `record`'s RETURN echoes anchors back as "target_id", so that's
+            # the natural guess on the way back in — but the input key is
+            # "id". Say so instead of just naming the missing key.
+            if spec.get("target_id"):
+                raise ValueError(
+                    f"relates_to entry missing 'id' — got 'target_id' instead; "
+                    f"relates_to takes 'id' on input (only the returned "
+                    f"'anchored'/'related' envelopes use 'target_id'): {spec}"
+                )
             raise ValueError(f"relates_to entry missing 'id': {spec}")
-        target_label = _lookup_node_label(conn, target_id)
-        if target_label is None:
+        resolved = _resolve_node_id(conn, target_id)
+        if resolved is None:
             raise ValueError(
                 f"relates_to target {target_id!r} is not a memory node"
             )
+        # Expanded so the edge is written against the full id, not the prefix.
+        target_label, target_id = resolved
         endpoints = MEMORY_EDGE_ENDPOINTS.get(kind)
         if endpoints is not None:
             allowed_from, allowed_to = endpoints
@@ -580,89 +633,48 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         """Record a durable memory: decision / task / idea / note / summary /
         blocker / fact / solution / episode.
 
-        Write tool. One polymorphic entry point — pick `kind` per the taxonomy
-        below; the server creates the right graph node and a matching embedding
-        row so future `query_memory` calls can find it semantically.
+        Write tool. Pick `kind` per the taxonomy below; the server creates the
+        right graph node plus an embedding row so `query_memory` finds it
+        later. Memories are SHARED across every AI tool on this server (Claude
+        Code, Codex, Cursor) — write for the next agent, not just future-you.
 
-        Memories are SHARED across every AI tool connected to this knowitall
-        server (Claude Code, Codex, Cursor, etc.). Write for the next agent
-        — possibly running in a different tool — not just for future-you in
-        this session.
+        ARGUMENT SHAPES (the parts you cannot guess; rest is prose):
+          anchors: [{"kind": ..., ...}] — key is "kind", NOT "type".
+            "commit" needs "sha" (+"repo"); "file" needs "path" (+"repo");
+            "project"/"concept" need "name"; "symbol" needs "name"+"file";
+            "person" needs "email". Same shape in `amend`'s add_anchors and
+            `update_todo`'s anchors. Pass MULTIPLE project/concept anchors
+            to scope cross-cutting knowledge (README: "Scoping memories
+            across projects").
+          relates_to: [{"kind": "supersedes"|"refines"|"contradicts"|
+            "relates_to"|"blocks", "id": "<memory id>"}] — key is "id", NOT
+            "target_id" (only the RESPONSE uses "target_id"). "blocks"
+            requires Task→Task. Bad ids raise before any write.
+          body: self-contained prose, readable without surrounding chat.
+          summary: <=200 chars, title-shaped; falls back to body's first 200.
+          project_hint: project NAME (not id); created if novel.
+          Ids anywhere accept unambiguous >=8-char prefixes.
 
-        Use this when something would be useful in a FUTURE session,
-        after the current context window is gone. Good triggers:
-          - The user states something durable about themselves or the project
-            ("we always do X", "next we want Y", "Z is the blocker").
-          - A design decision is made — capture the choice AND the rationale.
-          - A bug is tracked down — capture the root cause and the fix.
-          - A tricky env/setup/import/config issue was resolved — capture it
-            as `kind="solution"`. Future-you (or another AI tool) WILL hit
-            this again; the lookup is only useful if the entry is findable.
-          - A feature is finished — capture what was built.
-          - Session is wrapping up: proactively ASK before storing a `summary`.
+        kind: "decision"|"task"|"idea"|"note" become first-class graph nodes
+        (citable, edge targets). "summary"|"blocker"|"fact"|"solution"|
+        "episode" become Episode nodes carrying the kind, for narrative
+        content. "note" is title-only — a body over 200 chars is REJECTED;
+        use "fact"/"idea"/"decision"/"task" for anything longer.
 
-        Do NOT use for: transient debug output, things already captured in git
-        or code, scratchpad thinking, or speculative ideas the user hasn't
-        endorsed.
+        Record what will matter in a FUTURE session: durable statements about
+        the user or project, decisions WITH rationale, root causes and their
+        fixes, finished work. Not for debug output, anything already in git or
+        code, or speculation the user hasn't endorsed. When a session wraps
+        up, ASK before storing a `summary`.
 
-        kind taxonomy:
-          - "decision" | "task" | "idea" | "note": become first-class graph
-            nodes (citable, expandable, can be the target of edges).
-          - "summary" | "blocker" | "fact" | "solution" | "episode": become
-            Episode nodes carrying the kind, for less structural / more
-            narrative content.
-          - "note" is title-only: <=200 chars, no long body column. A body
-            over 200 chars is REJECTED — use "fact"/"idea"/"decision"/"task"
-            for anything longer than a title (see PLAN.md for why `note`
-            is shaped this way).
-
-        kind="solution" body shape (FOLLOW THIS — semantic retrieval depends
-        on it):
-          Line 1: the verbatim error string or exact symptom (paste it,
-                  don't paraphrase). This is what future-you will search.
-          Line 2: the command / context that surfaces it.
-          Body:   the fix, and how you verified it worked.
-          Last line: `Discoverable keywords: <3-5 paraphrases the future
-                  searcher might type>` — embedding models cluster on
-                  lexical neighbors, so paraphrases on the page widen
-                  the recall surface.
-        After recording, run `query_memory` with the symptom phrasing you
-        expect future-you to use. If your entry isn't top-1, amend the body
-        until it is. If a similar solution already exists, `amend` it
-        instead of recording a duplicate — duplicates split the embedding
-        signal and bury the right answer.
-
-        body: self-contained prose. Must be readable without surrounding chat.
-
-        project_hint: project NAME (not id). If novel, a Project node is
-        created. Omit to leave unattached.
-
-        anchors: typed JSON citations, e.g. {"kind":"commit","sha":...,
-        "repo":...}, {"kind":"file","repo":...,"path":...},
-        {"kind":"project","name":...}, {"kind":"concept","name":...}
-        (less common: "symbol", "person" — shapes in README). Existing
-        nodes are reused by natural key. Pass MULTIPLE project/concept
-        anchors to scope shared/cross-cutting knowledge (an internal
-        library, a framework gotcha) so it surfaces under every anchor's
-        `query_memory`/`list_memories` hint — worked examples in README's
-        "Scoping memories across projects".
-
-        summary: optional ≤200-char title-shaped string surfaced by
-        `list_memories` and `get_memory`. If omitted, those tools fall
-        back to the first 200 chars of body. Validation rejects strings
-        longer than SUMMARY_MAX_LEN — fail at write-time rather than
-        silently truncate. For `kind="note"` the summary writes to the
-        existing `title` column (Note has no parallel summary field) —
-        since a Note IS its title, `summary` and `body` are two names for
-        the same ≤200-char string on a Note.
-
-        relates_to: optional list of memory→memory edges to write. Each
-        entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to"|
-        "blocks", "id": "<existing memory node id>"}. Target ids are
-        validated (must resolve to a memory-bearing node) — bad ids
-        raise ValueError before any state changes. "blocks" additionally
-        requires both endpoints be Task nodes (the underlying BLOCKS
-        edge is Task→Task only).
+        kind="solution" (env/setup/config gotchas) — retrieval depends on the
+        body shape: line 1 the verbatim error string (paste, don't
+        paraphrase), line 2 the command that surfaces it, then the fix and
+        how you verified it, last line `Discoverable keywords: <3-5
+        paraphrases a future searcher might type>`. Then run `query_memory`
+        with the phrasing you'd expect; if it isn't top-1, amend until it is.
+        Amend a near-duplicate rather than adding one — duplicates split the
+        embedding signal.
 
         Returns: {"id", "node_type", "project_id", "anchored": [...],
         "related": [...]}.
@@ -763,8 +775,14 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         blocked, completed, or abandoned. Optional anchors record what closed
         or blocked the task — typically a commit anchor for "done".
 
+        id: the Task id from `record` / `list_memories`. An unambiguous
+          prefix of >=8 chars also resolves.
         status: free-form, but conventional values are
           "open" | "in_progress" | "blocked" | "done" | "abandoned".
+        anchors: same shape as `record`'s `anchors` — a list of typed JSON
+          citations keyed on "kind" (NOT "type"), e.g.
+          [{"kind":"commit","sha":"abc123","repo":"knowitall"}]. See
+          `record`'s docstring for the per-kind required fields.
         When status=="done" and a commit anchor is provided, a CLOSED_BY edge
         is also written from Task to Commit. Every call bumps `amended_at`,
         so a date-window query (`list_memories`'s since/until) catches
@@ -775,11 +793,18 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         conn = state.kuzu_conn()
         now = _now()
         # Verify Task exists and isn't retracted.
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
+            raise ValueError(f"no Task with id={id}")
+        label, id = resolved
+        if label != "Task":
+            raise ValueError(
+                f"id={id} is a {label.lower()}, not a task — update_todo only "
+                "transitions tasks. Use amend to edit other memory kinds."
+            )
         result = conn.execute(
             "MATCH (t:Task {id: $id}) RETURN t.retracted_at LIMIT 1", {"id": id}
         )
-        if not result.has_next():
-            raise ValueError(f"no Task with id={id}")
         row = result.get_next()
         if row[0] is not None:
             raise ValueError(f"Task {id} is retracted")
@@ -834,7 +859,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         etc.) keep pointing at the right thing.
 
         Args:
-          id: the node id returned by `record` / `list_memories`.
+          id: the node id returned by `record` / `list_memories`. An
+            unambiguous prefix of >=8 chars also resolves.
           body: if provided, replaces the stored body AND re-embeds. The
             old embedding row is deleted and a fresh one inserted, so
             subsequent `query_memory` calls reflect the new wording. For
@@ -844,8 +870,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             past a title.
           summary: if provided, replaces the stored summary. Pure graph
             SET — no re-embed (summary is not part of the embedded text).
-            For `kind=note` the value writes to `title`. Validated against
-            SUMMARY_MAX_LEN.
+            For `kind=note` the value writes to `title`. Must be <=200
+            chars, same limit `record`'s `summary` enforces.
           add_anchors: list of typed anchor JSON (same shapes as
             `record`'s `anchors` arg) to add. Idempotent — existing
             ANCHORED_TO edges are not duplicated.
@@ -859,35 +885,49 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             once: `amend(id, retract=False, body="corrected text")`. A
             retracted node rejects every OTHER kind of edit (body/summary/
             anchors) unless this same call also passes retract=False.
-          reason: short string persisted alongside a retraction (only
-            meaningful together with retract=True — passing it otherwise
-            raises ValueError rather than silently dropping it).
+          reason: short string explaining why this call happened. With
+            retract=True it persists to `retract_reason`; on any other
+            amend it persists to `amend_reason`, next to the `amended_at`
+            it explains. Most useful on a correcting amend ("this reverses
+            an earlier correction that was itself wrong") — that's the one
+            thing a diff of the body can't tell you later. Both fields are
+            last-write-wins: they describe the most recent change, not a
+            revision history.
+
+        Rejections are batched: a payload with several problems reports all
+        of them in one error, so it takes one round trip to fix rather than
+        one per problem.
 
         Returns: {"id", "node_type", "amended_at", "re_embedded": bool,
-        "added": [...], "removed": [...], "retracted_at", "retract_reason"}.
+        "added": [...], "removed": [...], "retracted_at", "retract_reason",
+        "amend_reason"}.
         """
+        # Every rejection below discards the whole call, body included, so
+        # one violation per round trip means a caller with two problems in
+        # one payload pays for two rejected writes — and can't see the
+        # second problem until the first is fixed. Collect them all, raise
+        # once. Only an unresolvable id short-circuits, since nothing
+        # label-dependent can be checked without it.
+        problems: list[str] = []
         if summary is not None and len(summary) > SUMMARY_MAX_LEN:
-            raise ValueError(
-                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})."
-            )
-        if reason is not None and not retract:
-            raise ValueError(
-                "reason is only meaningful together with retract=True "
-                f"(got retract={retract!r})"
+            problems.append(
+                f"summary too long ({len(summary)} > {SUMMARY_MAX_LEN})"
             )
         if (
             body is None and summary is None and not add_anchors
-            and not remove_anchors and retract is None
+            and not remove_anchors and retract is None and reason is None
         ):
-            raise ValueError(
+            problems.append(
                 "amend requires at least one of body / summary / add_anchors "
-                "/ remove_anchors / retract"
+                "/ remove_anchors / retract / reason"
             )
 
         conn = state.kuzu_conn()
-        label = _lookup_node_label(conn, id)
-        if label is None:
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
             raise ValueError(f"no memory node with id={id}")
+        # Every write below keys on the full id, so rebind before using it.
+        label, id = resolved
 
         # Retracted nodes reject every edit except un-retracting (retract=
         # False) — addressable via get_memory either way, but not silently
@@ -900,10 +940,20 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             retracted_check.has_next() and retracted_check.get_next()[0] is not None
         )
         if is_retracted and retract is not False:
-            raise ValueError(
+            problems.append(
                 f"cannot amend retracted node {id} — pass retract=False in "
                 "this same call to un-retract it first, or a separate call."
             )
+        if label == "Note" and body is not None and len(body) > SUMMARY_MAX_LEN:
+            problems.append(
+                f"amended note body is {len(body)} chars but a Note "
+                f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
+                "longer content, record a new kind=\"fact\"/\"idea\"/"
+                "\"decision\"/\"task\" instead; don't grow a note past "
+                "a title."
+            )
+        if problems:
+            raise ValueError("; ".join(problems))
 
         now = _now()
         fields = _LIST_FIELDS[label]
@@ -913,16 +963,8 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         re_embedded = False
         if body is not None:
-            if label == "Note" and len(body) > SUMMARY_MAX_LEN:
-                raise ValueError(
-                    f"amended note body is {len(body)} chars but a Note "
-                    f"only stores a {SUMMARY_MAX_LEN}-char title. To keep "
-                    "longer content, record a new kind=\"fact\"/\"idea\"/"
-                    "\"decision\"/\"task\" instead; don't grow a note past "
-                    "a title."
-                )
             # Note's body lives in `title`, clipped at SUMMARY_MAX_LEN — a
-            # no-op now that the length is validated above.
+            # no-op now that the length is validated up front.
             stored_body = body[:SUMMARY_MAX_LEN] if label == "Note" else body
             conn.execute(
                 f"MATCH (n:{label} {{id: $id}}) SET n.{body_field} = $b",
@@ -1039,9 +1081,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             except Exception:
                 pass
 
+        # `reason` explains whichever operation this call actually is: a
+        # retraction routes it to retract_reason (set above), anything else
+        # to amend_reason, alongside the amended_at it explains.
+        amend_reason = reason if not retract else None
         conn.execute(
-            f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now",
-            {"id": id, "now": now},
+            f"MATCH (n:{label} {{id: $id}}) SET n.amended_at = $now"
+            + (", n.amend_reason = $reason" if amend_reason is not None else ""),
+            {"id": id, "now": now, "reason": amend_reason}
+            if amend_reason is not None
+            else {"id": id, "now": now},
         )
 
         return {
@@ -1053,6 +1102,7 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "removed": removed,
             "retracted_at": now.isoformat() if retract else None,
             "retract_reason": reason if retract else None,
+            "amend_reason": amend_reason,
         }
 
     @mcp.tool()
@@ -1430,16 +1480,22 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
 
         Args:
           id: the node id returned by `record` / `list_memories` / etc.
+            An unambiguous prefix of >=8 chars also resolves (the short
+            form that appears in chat and commit messages); the returned
+            `id` is always the full one. An ambiguous prefix raises with
+            the candidates listed.
           include_neighbors: if True, also returns 1-hop ANCHORED_TO
             neighbors (same shape as `query_memory` neighbors).
 
         Returns: {id, node_type, body, summary, project_id, created_at,
-        retracted_at, neighbors?} or None if no memory has that id.
+        retracted_at, retract_reason, amended_at, amend_reason, neighbors?}
+        or None if no memory has that id.
         """
         conn = state.kuzu_conn()
-        label = _lookup_node_label(conn, id)
-        if label is None:
+        resolved = _resolve_node_id(conn, id)
+        if resolved is None:
             return None
+        label, id = resolved
 
         fields = _LIST_FIELDS[label]
         ts_field = fields["created_at_field"]
@@ -1455,14 +1511,16 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             f"OPTIONAL MATCH (n)-[:ANCHORED_TO]->(p:Project) "
             f"RETURN n.{body_field} AS body_value, "
             f"{summary_select} AS stored_summary, n.{ts_field}, "
-            f"n.retracted_at, p.id LIMIT 1",
+            f"n.retracted_at, n.retract_reason, n.amended_at, "
+            f"n.amend_reason, p.id LIMIT 1",
             {"id": id},
         )
         if not result.has_next():
             return None
-        body_value, stored_summary, created_at, retracted_at, project_id = (
-            result.get_next()
-        )
+        (
+            body_value, stored_summary, created_at, retracted_at,
+            retract_reason, amended_at, amend_reason, project_id,
+        ) = result.get_next()
 
         out: dict[str, Any] = {
             "id": id,
@@ -1474,6 +1532,14 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
             "retracted_at": (
                 retracted_at.isoformat() if retracted_at is not None else None
             ),
+            "retract_reason": retract_reason,
+            # Paired: amended_at says when the last edit landed, amend_reason
+            # says why. Without both, a date-window list_memories hit is a
+            # timestamp with no story attached.
+            "amended_at": (
+                amended_at.isoformat() if amended_at is not None else None
+            ),
+            "amend_reason": amend_reason,
         }
         if label == "Note" and body_value is not None and len(body_value) >= SUMMARY_MAX_LEN:
             # Legacy over-length note (recorded/amended before the

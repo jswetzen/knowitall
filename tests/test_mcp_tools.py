@@ -359,11 +359,53 @@ async def test_amend_retract_unknown_id_raises(tools):
         await fns["amend"](id="nope", retract=True, reason="r")
 
 
-async def test_amend_reason_without_retract_raises(tools, fake_embed):
+async def test_amend_reason_without_retract_persists_as_amend_reason(
+    tools, fake_embed
+):
+    """A correcting amend is where `reason` is worth most — it used to raise."""
     fns, _ = tools
     out = await fns["record"](kind="idea", body="x")
-    with pytest.raises(ValueError, match="only meaningful together with retract=True"):
-        await fns["amend"](id=out["id"], body="y", reason="not retracting")
+    res = await fns["amend"](
+        id=out["id"], body="y", reason="reverses an earlier wrong correction"
+    )
+    assert res["amend_reason"] == "reverses an earlier wrong correction"
+    assert res["retract_reason"] is None
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["body"] == "y"
+    assert got["amend_reason"] == "reverses an earlier wrong correction"
+    assert got["amended_at"] is not None
+
+
+async def test_amend_reason_routes_to_retract_reason_when_retracting(
+    tools, fake_embed
+):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    res = await fns["amend"](id=out["id"], retract=True, reason="dup")
+    assert res["retract_reason"] == "dup"
+    assert res["amend_reason"] is None
+
+    got = await fns["get_memory"](id=out["id"])
+    assert got["retract_reason"] == "dup"
+    assert got["amend_reason"] is None
+
+
+async def test_amend_reason_alone_is_a_valid_edit(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    res = await fns["amend"](id=out["id"], reason="annotating why, no content change")
+    assert res["amend_reason"] == "annotating why, no content change"
+    assert res["re_embedded"] is False
+
+
+async def test_amend_reason_is_last_write_wins(tools, fake_embed):
+    fns, _ = tools
+    out = await fns["record"](kind="idea", body="x")
+    await fns["amend"](id=out["id"], body="y", reason="first")
+    await fns["amend"](id=out["id"], body="z", reason="second")
+    got = await fns["get_memory"](id=out["id"])
+    assert got["amend_reason"] == "second"
 
 
 async def test_amend_unretract_restores_editability(tools, fake_embed):
@@ -773,6 +815,84 @@ async def test_get_memory_returns_full_body(tools, fake_embed):
     assert "neighbors" not in got
 
 
+async def test_get_memory_resolves_id_prefix(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="idea", body="prefix me")
+    got = await fns["get_memory"](id=stored["id"][:8])
+    assert got is not None
+    assert got["body"] == "prefix me"
+    # The full id comes back, not the prefix that was passed in.
+    assert got["id"] == stored["id"]
+
+
+async def test_amend_resolves_id_prefix(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="idea", body="original")
+    out = await fns["amend"](id=stored["id"][:8], body="corrected")
+    assert out["id"] == stored["id"]
+    got = await fns["get_memory"](id=stored["id"])
+    assert got["body"] == "corrected"
+
+
+async def test_update_todo_resolves_id_prefix(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="task", body="ship thing")
+    out = await fns["update_todo"](id=stored["id"][:8], status="done")
+    assert out["id"] == stored["id"]
+    rows = await fns["cypher"](
+        "MATCH (t:Task {id: $id}) RETURN t.status", {"id": stored["id"]}
+    )
+    assert rows[0][0] == "done"
+
+
+async def test_relates_to_resolves_id_prefix(tools, fake_embed):
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="x")
+    b = await fns["record"](
+        kind="idea",
+        body="y",
+        relates_to=[{"kind": "supersedes", "id": a["id"][:8]}],
+    )
+    # Edge must land on the full id, not the prefix.
+    rows = await fns["cypher"](
+        "MATCH (s:Idea {id: $sid})-[:SUPERSEDES_MEMORY]->(t:Idea) RETURN t.id",
+        {"sid": b["id"]},
+    )
+    assert rows == [[a["id"]]]
+
+
+async def test_ambiguous_id_prefix_lists_candidates(tools, fake_embed, monkeypatch):
+    """Two nodes sharing a prefix must report both, not silently pick one."""
+    fns, _ = tools
+    shared = "abcdef01"
+    ids = [f"{shared}-0000-4000-8000-00000000000{n}" for n in (1, 2)]
+    seq = iter(ids)
+    monkeypatch.setattr(
+        "server.mcp_tools.uuid.uuid4", lambda: next(seq)
+    )
+    for _ in ids:
+        await fns["record"](kind="idea", body="dupe")
+
+    with pytest.raises(ValueError, match="ambiguous") as exc:
+        await fns["get_memory"](id=shared)
+    for i in ids:
+        assert i in str(exc.value)
+
+
+async def test_short_id_prefix_is_not_expanded(tools, fake_embed):
+    """Under 8 chars is more likely a typo than an abbreviation."""
+    fns, _ = tools
+    stored = await fns["record"](kind="idea", body="x")
+    assert await fns["get_memory"](id=stored["id"][:6]) is None
+
+
+async def test_update_todo_rejects_non_task_id(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="idea", body="not a task")
+    with pytest.raises(ValueError, match="is a idea, not a task"):
+        await fns["update_todo"](id=stored["id"], status="done")
+
+
 async def test_get_memory_unknown_id_returns_none(tools):
     fns, _ = tools
     assert await fns["get_memory"](id="does-not-exist") is None
@@ -987,6 +1107,39 @@ async def test_record_relates_to_unknown_target_raises(tools, fake_embed):
         )
 
 
+async def test_record_relates_to_target_id_names_the_right_key(tools, fake_embed):
+    """"target_id" is the return-envelope key; on input it must be "id"."""
+    fns, _ = tools
+    a = await fns["record"](kind="idea", body="x")
+    with pytest.raises(ValueError, match="got 'target_id' instead"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            relates_to=[{"kind": "supersedes", "target_id": a["id"]}],
+        )
+
+
+async def test_record_anchor_type_names_the_right_key(tools, fake_embed):
+    fns, _ = tools
+    with pytest.raises(ValueError, match="got 'type' instead"):
+        await fns["record"](
+            kind="idea",
+            body="y",
+            anchors=[{"type": "commit", "sha": "deadbeef", "repo": "knowitall"}],
+        )
+
+
+async def test_update_todo_anchor_type_names_the_right_key(tools, fake_embed):
+    fns, _ = tools
+    stored = await fns["record"](kind="task", body="ship thing")
+    with pytest.raises(ValueError, match="got 'type' instead"):
+        await fns["update_todo"](
+            id=stored["id"],
+            status="done",
+            anchors=[{"type": "commit", "sha": "deadbeef", "repo": "knowitall"}],
+        )
+
+
 async def test_record_relates_to_blocks_writes_typed_edge(tools, fake_embed):
     # Task→Task blocks should write the v1 BLOCKS edge, not the generic
     # RELATES_TO_MEMORY. This is what `relates_to: kind="blocks"` exists for.
@@ -1095,6 +1248,22 @@ async def test_amend_rejects_oversize_summary(tools, fake_embed):
     out = await fns["record"](kind="idea", body="x")
     with pytest.raises(ValueError, match="summary too long"):
         await fns["amend"](id=out["id"], summary="y" * 201)
+
+
+async def test_amend_reports_every_violation_at_once(tools, fake_embed):
+    """One rejection per round trip hid later problems behind earlier ones."""
+    fns, _ = tools
+    stored = await fns["record"](kind="note", body="short title")
+    await fns["amend"](id=stored["id"], retract=True, reason="dup")
+
+    with pytest.raises(ValueError) as exc:
+        await fns["amend"](
+            id=stored["id"], body="b" * 201, summary="s" * 201
+        )
+    msg = str(exc.value)
+    assert "summary too long" in msg
+    assert "cannot amend retracted" in msg
+    assert "note body is 201 chars" in msg
 
 
 async def test_amend_add_anchors(tools, fake_embed):
