@@ -102,9 +102,18 @@ insert/copy, fixed in #4786) is a different sequence and not a crash.
 
 This is now the strongest argument for replacing Kùzu: the store carries
 damage that the engine itself cannot repair, and the engine will never be
-fixed. A migration onto a different backend is also the natural moment to
-rebuild the `Idea` table cleanly, since the data would be read out and
-rewritten anyway.
+fixed. Tracked as a roadmap item in the README.
+
+Note that a community fork is a live option (the code is MIT; LadybugDB,
+Vela-Engineering/kuzu and Kineviz's bighorn all exist) — but a fork branched
+off 0.11.3 inherits this bug unless someone has fixed it there, and nobody
+filed it upstream before the archive. Any candidate should be run against the
+strict xfail below before it is trusted with this data.
+
+Either way, the migration is the moment to rebuild `Idea` cleanly: the rows
+get read out and rewritten regardless, which repairs the damage as a side
+effect. So the criterion that matters when choosing is simply whether the
+candidate can rewrite a table that Kùzu 0.11.3 cannot.
 
 ## Regression coverage
 

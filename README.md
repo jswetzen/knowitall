@@ -189,6 +189,36 @@ Near-term (next few slices, à la carte):
 - **Re-embed-on-model-swap tool** — `model_version` is recorded; no migration
   helper yet.
 
+Forced, not optional — **replace or fork Kùzu**:
+
+Kùzu was archived 2025-10-10 (Apple acquired Kùzu Inc.), with 0.11.3 the final
+release. That alone would only be a slow-burn concern, but our store also
+carries real damage: `ALTER TABLE ... DROP` leaves chunks that segfault on a
+full checkpoint, so `Idea` cannot be rewritten by the engine that damaged it.
+Normal operation is unaffected — details and measurements in
+`docs/kuzu-drop-column-hazard.md`.
+
+Two shapes of answer, both open:
+
+- **A maintained fork.** The code is MIT, and several exist —
+  [LadybugDB](https://gdotv.com/blog/kuzu-legacy-embedded-graph-database-landscape/),
+  [Vela-Engineering/kuzu](https://vela.partners/blog/kuzudb-ai-agent-memory-graph-database)
+  (multi-writer, aimed at agent memory), and Kineviz's *bighorn*. Cheapest path
+  by far: same Cypher, same embedded model, likely a drop-in swap. But a fork
+  off 0.11.3 inherits this bug unless it has actually been fixed there — our
+  repro was never filed upstream before the archive, so **check the fork
+  against `tests/test_schema_migrate.py`'s xfail before committing to it.**
+- **A different engine.** Migration guides exist for
+  [ArcadeDB](https://arcadedb.com/blog/from-kuzudb-to-arcadedb-migration-guide/)
+  and [FalkorDB](https://www.falkordb.com/blog/kuzudb-to-falkordb-migration/).
+  More work, and both are servers rather than embedded, which changes the
+  deployment story.
+
+Either way the migration is the moment to rebuild `Idea` cleanly, since every
+row gets read out and rewritten anyway — that repairs the damage as a side
+effect. The evaluation criterion that actually matters here is therefore: *can
+the candidate rewrite a table that Kùzu 0.11.3 cannot?*
+
 Longer-term (only if it earns its keep): PPR retrieval seeded from
 query-extracted entities, Joplin importer, idea-graveyard query,
 `graduate_idea` to promote ideas to projects, `/consolidate` for summary
