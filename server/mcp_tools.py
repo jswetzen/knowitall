@@ -637,6 +637,21 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         below; the server creates the right graph node and a matching embedding
         row so future `query_memory` calls can find it semantically.
 
+        ARGUMENT SHAPES (first, deliberately: tool descriptions get truncated
+        around 2k chars by some clients, and these are the only parts of this
+        docstring you cannot guess — everything below is prose you can lose):
+          anchors: [{"kind": ..., ...}] — the key is "kind", NOT "type".
+            "commit" needs "sha" (+"repo"); "file" needs "path" (+"repo");
+            "project"/"concept" need "name"; "symbol" needs "name"+"file";
+            "person" needs "email".
+          relates_to: [{"kind": "supersedes"|"refines"|"contradicts"|
+            "relates_to"|"blocks", "id": "<existing memory id>"}] — the key
+            is "id", NOT "target_id". Only the RESPONSE uses "target_id";
+            input and output name the same concept differently.
+          summary: <=200 chars. For kind="note", body is <=200 chars too.
+        Same anchor shape is used by `amend`'s add_anchors and
+        `update_todo`'s anchors.
+
         Memories are SHARED across every AI tool connected to this knowitall
         server (Claude Code, Codex, Cursor, etc.). Write for the next agent
         — possibly running in a different tool — not just for future-you in
@@ -690,13 +705,10 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         project_hint: project NAME (not id). If novel, a Project node is
         created. Omit to leave unattached.
 
-        anchors: typed JSON citations, e.g. {"kind":"commit","sha":...,
-        "repo":...}, {"kind":"file","repo":...,"path":...},
-        {"kind":"project","name":...}, {"kind":"concept","name":...}
-        (less common: "symbol", "person" — shapes in README). Existing
-        nodes are reused by natural key. Pass MULTIPLE project/concept
-        anchors to scope shared/cross-cutting knowledge (an internal
-        library, a framework gotcha) so it surfaces under every anchor's
+        anchors (shape above): typed JSON citations. Existing nodes are
+        reused by natural key. Pass MULTIPLE project/concept anchors to
+        scope shared/cross-cutting knowledge (an internal library, a
+        framework gotcha) so it surfaces under every anchor's
         `query_memory`/`list_memories` hint — worked examples in README's
         "Scoping memories across projects".
 
@@ -709,13 +721,12 @@ def register_tools(mcp: FastMCP, state: AppState) -> None:
         since a Note IS its title, `summary` and `body` are two names for
         the same ≤200-char string on a Note.
 
-        relates_to: optional list of memory→memory edges to write. Each
-        entry: {"kind": "supersedes"|"refines"|"contradicts"|"relates_to"|
-        "blocks", "id": "<existing memory node id>"}. Target ids are
-        validated (must resolve to a memory-bearing node) — bad ids
-        raise ValueError before any state changes. "blocks" additionally
-        requires both endpoints be Task nodes (the underlying BLOCKS
-        edge is Task→Task only).
+        relates_to (shape above): optional memory→memory edges. Target ids
+        are validated (must resolve to a memory-bearing node) — bad ids
+        raise ValueError before any state changes. Ids may be given as
+        unambiguous >=8-char prefixes. "blocks" additionally requires both
+        endpoints be Task nodes (the underlying BLOCKS edge is Task→Task
+        only).
 
         Returns: {"id", "node_type", "project_id", "anchored": [...],
         "related": [...]}.
